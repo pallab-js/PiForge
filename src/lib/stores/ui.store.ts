@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store';
 
-export type ViewType = 'canvas' | 'graph' | 'board' | 'list' | 'notes';
+export type ViewType = 'canvas' | 'graph' | 'board' | 'list' | 'notes' | 'code';
 
 export interface ToastMessage {
   id: string;

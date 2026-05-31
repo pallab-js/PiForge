@@ -13,6 +13,7 @@
   import BoardView from '../board/BoardView.svelte';
   import ListView from '../list/ListView.svelte';
   import NotesView from '../notes/NotesView.svelte';
+  import CodeView from '../code/CodeView.svelte';
 
   let { children } = $props<{ children?: any }>();
 
@@ -44,6 +45,8 @@
         <ListView />
       {:else if $activeView === 'notes'}
         <NotesView />
+      {:else if $activeView === 'code'}
+        <CodeView />
       {/if}
     </main>
 

@@ -98,6 +98,18 @@
         <span class="text-sm">Documentation</span>
       {/if}
     </button>
+
+    <button 
+      onclick={() => setView('code')} 
+      class="flex items-center gap-3 w-full px-3 py-2 rounded-md transition-all text-left relative overflow-hidden group
+        {$activeView === 'code' ? 'bg-[var(--bg-selected)] text-[var(--text-primary)] font-medium border-l-2 border-[var(--accent-coral)]' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}"
+      aria-label="Code Scaffolder"
+    >
+      <span class="text-lg">💻</span>
+      {#if !$sidebarCollapsed}
+        <span class="text-sm">Code Scaffolder</span>
+      {/if}
+    </button>
   </div>
 
   <!-- Library Section -->
