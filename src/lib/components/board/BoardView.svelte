@@ -130,7 +130,6 @@
   <div class="flex gap-4 p-4 items-start h-full min-w-max select-none">
     {#each $columnsList as col}
       <div 
-        onapp-drop={(e) => handleDrop(e, col.id)}
         ondragover={handleDragOver}
         ondrop={(e) => handleDrop(e, col.id)}
         class="flex flex-col w-[260px] max-h-full bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-lg p-3 select-none"

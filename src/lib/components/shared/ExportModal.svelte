@@ -1,5 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
+  import type { Project } from '../../types';
   import { activeProject, tasksList, columnsList, projectNotes, activeCanvasState, selectProject, initProjects } from '../../stores/project.store';
   import { addToast } from '../../stores/ui.store';
   import { BUILTIN_COMPONENTS } from '../../components-library';
@@ -191,7 +192,7 @@
         // Hydrate Mock Database
         // Retrieve projects and append
         if (typeof localStorage !== 'undefined') {
-          const importedProj: activeProject = data.project;
+          const importedProj: Project = data.project;
           
           // Deduplicate if already exists
           let projects = JSON.parse(localStorage.getItem('piforge_projects') || '[]');
