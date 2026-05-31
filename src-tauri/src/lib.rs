@@ -585,3 +585,237 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to spin up an in-memory SQLite database and run migrations
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("Failed to open test database");
+        run_migrations(&conn).expect("Failed to run database migrations");
+        conn
+    }
+
+    #[test]
+    fn test_database_migrations_integrity() {
+        let conn = setup_test_db();
+        
+        // Verify tables exist
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|t| t.unwrap())
+            .collect();
+            
+        assert!(tables.contains(&"projects".to_string()));
+        assert!(tables.contains(&"tasks".to_string()));
+        assert!(tables.contains(&"columns".to_string()));
+        assert!(tables.contains(&"canvas_states".to_string()));
+        assert!(tables.contains(&"notes".to_string()));
+        assert!(tables.contains(&"settings".to_string()));
+    }
+
+    #[test]
+    fn test_project_crud_lifecycle() {
+        let conn = setup_test_db();
+        
+        let project_id = "test-project-uuid-1".to_string();
+        
+        // 1. Create Project
+        conn.execute(
+            "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                project_id,
+                "Smart Greenhouse",
+                "Greenhouse controller description",
+                "rpi5",
+                "planning",
+                123456789,
+                123456789,
+                "#cc785c"
+            ],
+        ).unwrap();
+
+        // 2. Read Project
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Smart Greenhouse");
+
+        // 3. Update Project
+        conn.execute(
+            "UPDATE projects SET name = ?, status = ? WHERE id = ?",
+            params!["Greenhouse Alpha", "active", project_id],
+        ).unwrap();
+        
+        let (updated_name, status): (String, String) = conn
+            .query_row(
+                "SELECT name, status FROM projects WHERE id = ?",
+                [&project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(updated_name, "Greenhouse Alpha");
+        assert_eq!(status, "active");
+
+        // 4. Delete Project
+        conn.execute("DELETE FROM projects WHERE id = ?", [&project_id]).unwrap();
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT name FROM projects WHERE id = ?",
+                [&project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(exists.is_none());
+    }
+
+    #[test]
+    fn test_task_crud_and_cascade_deletion() {
+        let conn = setup_test_db();
+        let proj_id = "proj-1".to_string();
+        let task_id = "task-1".to_string();
+        let col_id = "backlog".to_string();
+
+        // Seed project first
+        conn.execute(
+            "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![proj_id, "Greenhouse", "Desc", "rpi5", "planning", 100, 100, "coral"],
+        ).unwrap();
+
+        // 1. Insert Task
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, title, description, status, priority, labels, due_date, time_estimate, column_id, position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                task_id,
+                proj_id,
+                "Wiring up DHT22",
+                "Connect data pin to GPIO 4",
+                "backlog",
+                "p1",
+                "[\"hardware\"]",
+                None::<i64>,
+                30,
+                col_id,
+                1.0,
+                100,
+                100
+            ],
+        ).unwrap();
+
+        // Verify task exists
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM tasks WHERE id = ?",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Wiring up DHT22");
+
+        // 2. Cascade Delete: Deleting project should delete connected tasks automatically
+        conn.execute("DELETE FROM projects WHERE id = ?", [&proj_id]).unwrap();
+
+        let task_exists: Option<String> = conn
+            .query_row(
+                "SELECT title FROM tasks WHERE id = ?",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(task_exists.is_none()); // Deleted by cascade!
+    }
+
+    #[test]
+    fn test_canvas_state_and_notes_persistence() {
+        let conn = setup_test_db();
+        let proj_id = "proj-2".to_string();
+        let canvas_json = "{\"version\":\"1.0\",\"nodes\":[],\"edges\":[]}".to_string();
+        let markdown_notes = "# Smart controller documentation".to_string();
+
+        // Seed project first
+        conn.execute(
+            "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![proj_id, "Test Project", "Desc", "rpi5", "planning", 100, 100, "coral"],
+        ).unwrap();
+
+        // 1. Save and Load Canvas State
+        conn.execute(
+            "INSERT INTO canvas_states (project_id, state_json, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET state_json = EXCLUDED.state_json",
+            params![proj_id, canvas_json, 12345],
+        ).unwrap();
+
+        let loaded_canvas: String = conn
+            .query_row(
+                "SELECT state_json FROM canvas_states WHERE project_id = ?",
+                [&proj_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(loaded_canvas, canvas_json);
+
+        // 2. Save and Load Documentation Notes
+        conn.execute(
+            "INSERT INTO notes (project_id, content, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET content = EXCLUDED.content",
+            params![proj_id, markdown_notes, 12345],
+        ).unwrap();
+
+        let loaded_notes: String = conn
+            .query_row(
+                "SELECT content FROM notes WHERE project_id = ?",
+                [&proj_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(loaded_notes, markdown_notes);
+    }
+
+    #[test]
+    fn test_user_settings_configuration() {
+        let conn = setup_test_db();
+
+        // Save settings key-values
+        let settings = vec![
+            ("theme", "warm"),
+            ("accent_color", "teal"),
+            ("grid_type", "lines"),
+            ("snap_to_grid", "true"),
+        ];
+
+        for (k, v) in settings {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                [k, v],
+            ).unwrap();
+        }
+
+        // Verify loaded settings match
+        let theme: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'theme'", [], |row| row.get(0))
+            .unwrap();
+        let snap: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'snap_to_grid'", [], |row| row.get(0))
+            .unwrap();
+            
+        assert_eq!(theme, "warm");
+        assert_eq!(snap, "true");
+    }
+}
+
