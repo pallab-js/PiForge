@@ -4,7 +4,7 @@
   import { activeCanvasState, updateCanvasStateDirectly, tasksList, pushCanvasHistory, undoCanvas, redoCanvas } from '../../stores/project.store';
   import { selectedNodeId, selectedEdgeId, selectedPinId, addToast } from '../../stores/ui.store';
   import { settings } from '../../stores/settings.store';
-  import { BOARDS } from '../../rpi-boards';
+  import { BOARDS, RPI_40PIN_HEADER, RPI_PICO_HEADER } from '../../rpi-boards';
   import type { PinInfo } from '../../rpi-boards';
   import { BUILTIN_COMPONENTS } from '../../components-library';
   import * as ipc from '../../ipc';
@@ -22,6 +22,119 @@
   let isPanning = $state(false);
   let startPanX = $state(0);
   let startPanY = $state(0);
+
+  // Diagnostics Panel toggle state
+  let showDiagnostics = $state(false);
+
+  // Hardware Diagnostics & Conflicts Validator
+  interface DiagnosticIssue {
+    type: 'error' | 'warning';
+    message: string;
+  }
+
+  let diagnostics = $derived.by<DiagnosticIssue[]>(() => {
+    const canvas = $activeCanvasState;
+    if (!canvas) return [];
+
+    const issues: DiagnosticIssue[] = [];
+    const rpiNodes = canvas.nodes.filter(n => n.type === 'rpi_board');
+    if (rpiNodes.length === 0) return [];
+
+    const rpiNode = rpiNodes[0];
+    const header = rpiNode.boardModel?.includes('pico') ? RPI_PICO_HEADER : RPI_40PIN_HEADER;
+
+    // 1. Check for GPIO Pin Conflicts (multiple components wired to the same physical pin)
+    const pinUsage: Record<string, string[]> = {};
+
+    canvas.edges.forEach(edge => {
+      let rpiPinId: string | null = null;
+      let targetNodeId: string | null = null;
+
+      if (edge.sourceId === rpiNode.id && edge.sourcePinId) {
+        rpiPinId = edge.sourcePinId;
+        targetNodeId = edge.targetId;
+      } else if (edge.targetId === rpiNode.id && edge.targetPinId) {
+        rpiPinId = edge.targetPinId;
+        targetNodeId = edge.sourceId;
+      }
+
+      if (rpiPinId && targetNodeId) {
+        const targetNode = canvas.nodes.find(n => n.id === targetNodeId);
+        if (targetNode && targetNode.type === 'component') {
+          const pinName = rpiPinId;
+          if (!pinUsage[pinName]) pinUsage[pinName] = [];
+          
+          const label = targetNode.label || 'Component';
+          if (!pinUsage[pinName].includes(label)) {
+            pinUsage[pinName].push(label);
+          }
+        }
+      }
+    });
+
+    Object.entries(pinUsage).forEach(([pin, components]) => {
+      const physicalPin = parseInt(pin);
+      const pinInfo = header.find(p => p.physical === physicalPin);
+      const pinLabel = pinInfo ? `${pinInfo.function} (Pin ${pin})` : `Pin ${pin}`;
+
+      // Bypass shared buses (I2C Pin 3/5, HAT EEPROM Pin 27/28)
+      if (components.length > 1 && pin !== '3' && pin !== '5' && pin !== '27' && pin !== '28') {
+        issues.push({
+          type: 'error',
+          message: `GPIO Pin Conflict: ${pinLabel} is wired to multiple accessories: ${components.join(' and ')}.`
+        });
+      }
+    });
+
+    // 2. Check for power voltage mismatches
+    canvas.edges.forEach(edge => {
+      let rpiPinId: string | null = null;
+      let targetNodeId: string | null = null;
+      let targetPinId: string | null = null;
+
+      if (edge.sourceId === rpiNode.id && edge.sourcePinId) {
+        rpiPinId = edge.sourcePinId;
+        targetNodeId = edge.targetId;
+        targetPinId = edge.targetPinId || '1';
+      } else if (edge.targetId === rpiNode.id && edge.targetPinId) {
+        rpiPinId = edge.targetPinId;
+        targetNodeId = edge.sourceId;
+        targetPinId = edge.sourcePinId || '1';
+      }
+
+      if (rpiPinId && targetNodeId && targetPinId) {
+        const targetNode = canvas.nodes.find(n => n.id === targetNodeId);
+        if (targetNode && targetNode.type === 'component') {
+          const physicalPin = parseInt(rpiPinId);
+          const pinInfo = header.find(p => p.physical === physicalPin);
+          
+          if (pinInfo) {
+            // SG90 Servo power warnings (expects 5V)
+            if (targetNode.componentId === 'servo' && targetPinId === '1') {
+              if (pinInfo.type === 'power3v3') {
+                issues.push({
+                  type: 'warning',
+                  message: `Power Mismatch: SG90 Servo VCC is wired to 3.3V Power (Pin ${physicalPin}). 5V Power (Pin 2 or 4) is highly recommended for high-load torque.`
+                });
+              }
+            }
+
+            // Relay power warnings (expects 5V)
+            if (targetNode.componentId === 'relay' && targetPinId === '1') {
+              if (pinInfo.type === 'power3v3') {
+                issues.push({
+                  type: 'warning',
+                  message: `Power Mismatch: Relay coil VCC is wired to 3.3V (Pin ${physicalPin}). Use 5V Power (Pin 2 or 4) to ensure robust latching.`
+                });
+              }
+            }
+          }
+        }
+      }
+    });
+
+    return issues;
+  });
 
   let draggingNodeId = $state<string | null>(null);
   let dragStartX = $state(0);
@@ -631,4 +744,52 @@
       </div>
     </div>
   {/if}
+
+  <!-- REAL-TIME HARDWARE DIAGNOSTICS & CONFLICTS OVERLAY -->
+  <div class="absolute right-4 top-4 flex flex-col items-end gap-2 z-[90] select-none">
+    <!-- Float Badge -->
+    <button 
+      onclick={() => showDiagnostics = !showDiagnostics}
+      class="flex items-center gap-2 px-3 py-1.5 rounded-lg shadow-xl border text-xs font-semibold cursor-pointer transition-all hover:scale-102 bg-[var(--bg-surface)]
+        {diagnostics.length > 0 
+          ? 'border-[var(--accent-amber)] text-[var(--accent-amber)] animate-pulse' 
+          : 'border-[var(--accent-teal)] text-[var(--accent-teal)]'}"
+      aria-label="Diagnostics details"
+    >
+      {#if diagnostics.length > 0}
+        ⚠️ {diagnostics.length} Issue{diagnostics.length > 1 ? 's' : ''} Detected
+      {:else}
+        🛡️ Diagnostics: Clear
+      {/if}
+    </button>
+
+    <!-- Collapsible Diagnostics Dropdown list -->
+    {#if showDiagnostics}
+      <div class="w-72 bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-2xl p-4 flex flex-col gap-2.5 animate-slide-in">
+        <div class="flex items-center justify-between border-b border-[var(--border-subtle)] pb-1.5">
+          <span class="text-[10px] font-bold uppercase tracking-wider text-[var(--text-secondary)]">Board Diagnostics Ledger</span>
+          <button onclick={() => showDiagnostics = false} class="text-[var(--text-muted)] hover:text-[var(--text-primary)] text-[10px] font-bold">✕</button>
+        </div>
+        <div class="flex flex-col gap-2 max-h-[220px] overflow-y-auto pr-1">
+          {#if diagnostics.length === 0}
+            <div class="text-[10px] text-[var(--text-muted)] italic py-2 text-center">
+              All visual wire connections are physically safe. Zero GPIO pin conflicts or power mismatches detected.
+            </div>
+          {:else}
+            {#each diagnostics as issue}
+              <div 
+                class="flex gap-2 p-2 rounded text-[10px] leading-relaxed border
+                  {issue.type === 'error' 
+                    ? 'bg-[var(--color-error)]/5 border-[var(--color-error)]/25 text-[var(--color-error)]' 
+                    : 'bg-[var(--accent-amber)]/5 border-[var(--accent-amber)]/25 text-[var(--accent-amber)]'}"
+              >
+                <span class="shrink-0">{issue.type === 'error' ? '❌' : '⚠️'}</span>
+                <span>{issue.message}</span>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      </div>
+    {/if}
+  </div>
 </div>
