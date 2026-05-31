@@ -817,5 +817,65 @@ mod tests {
         assert_eq!(theme, "warm");
         assert_eq!(snap, "true");
     }
+
+    #[test]
+    fn test_columns_crud_and_project_cascade_deletion() {
+        let conn = setup_test_db();
+        let proj_id = "proj-column-test".to_string();
+        let col_id = "col-backlog".to_string();
+
+        // 1. Seed project
+        conn.execute(
+            "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![proj_id, "Column Test Project", "Desc", "rpi5", "planning", 100, 100, "teal"],
+        ).unwrap();
+
+        // 2. Insert Column
+        conn.execute(
+            "INSERT INTO columns (id, project_id, name, color, position, is_done)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![col_id, proj_id, "Sprint Backlog", "#5db8a6", 1.0, 0],
+        ).unwrap();
+
+        // Verify column exists
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM columns WHERE id = ?",
+                [&col_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Sprint Backlog");
+
+        // 3. Update Column
+        conn.execute(
+            "UPDATE columns SET name = ?, position = ? WHERE id = ?",
+            params!["Refined Backlog", 2.0, col_id],
+        ).unwrap();
+
+        let (updated_name, pos): (String, f64) = conn
+            .query_row(
+                "SELECT name, position FROM columns WHERE id = ?",
+                [&col_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(updated_name, "Refined Backlog");
+        assert_eq!(pos, 2.0);
+
+        // 4. Cascade Delete Project -> verifies columns are deleted automatically
+        conn.execute("DELETE FROM projects WHERE id = ?", [&proj_id]).unwrap();
+
+        let col_exists: Option<String> = conn
+            .query_row(
+                "SELECT name FROM columns WHERE id = ?",
+                [&col_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(col_exists.is_none()); // Deleted by cascade!
+    }
 }
 
