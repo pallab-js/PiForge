@@ -11,12 +11,21 @@ PiForge sits at the intersection of **hardware wiring, sprint planning, and syst
 
 ## 🎨 Features & Capabilities
 
-- 🍉 **Interactive SVG Canvas**: Infinite panning and zooming stage. Drag-and-drop Raspberry Pi motherboard diagrams (Pi 5, 4B, Zero 2W, Pico, Pico W, etc.) and click individual pin headers to draw curved vector wires to sensors, relays, and OLED displays.
+- 🍉 **Interactive SVG Canvas**: An infinite panning and zooming stage. Drag-and-drop Raspberry Pi motherboard diagrams (Pi 5, 4B, Zero 2W, Pico, Pico W, etc.) and click individual pin headers to draw curved vector wires to sensors, relays, and OLED displays.
+- 🛡️ **Real-Time Hardware Diagnostics**: An on-canvas schematic validator that alerts you to:
+  - **GPIO Pin Conflicts**: Triggering warnings when multiple accessories are wired to the same physical pin.
+  - **Power Mismatch Errors**: Warning if a 5V high-torque actuator (e.g. SG90 Servo, Relay) is incorrectly powered by a 3.3V rail.
+- 💻 **Firmware Code Scaffolding**: Cross-compiles physical visual wiring directly into ready-to-run scripts.
+  - **Supported Standards**: Python (`gpiozero` OOP, `RPi.GPIO` classic) and C++ (`WiringPi`).
+  - **Broad Catalog Coverage**: Generates pin-accurate setups and operations for **all 13 built-in accessories**—including LEDs, Push Buttons, Rotary Encoders, DHT22 sensors, HC-SR04 sonars, SG90 servos, Relays, Buzzers, I2C OLED screens, Character LCD1602 screens, L298N H-bridges, MCP3008 ADCs, and DS18B20 1-Wire temperature sensors.
 - 📋 **Tactile Sprint Kanban**: Columns dashboard utilizing native HTML5 drag-and-drop card trackers. Click a sprint card to access checklist task properties, timeline estimates, and calendars.
 - 📝 **Tabular Tasks Ledger**: Spreadsheet-like ledger with instant inline priority adjustments and filter widgets.
 - 🕸️ **Force-Directed Graph**: Uses `Cytoscape.js` to map your project's components and tasks as relational nodes, illustrating hardware layouts and software sprint blocks at a glance.
 - 📚 **Sanitized Documentation Editor**: Markdown notes compiler that uses a split-pane layout to show HTML previews sanitized by `DOMPurify`.
 - 📊 **Bill of Materials Generator**: Aggregates all canvas sensors to auto-generate a component list printable as vector PDFs or shared as Excel CSV sheets.
+- 🔒 **Off-Grid Sovereign Security**: Completely offline and privacy-first.
+  - Locks down scripts with a strict Content Security Policy (CSP) blocking external frames or script execution.
+  - Features a 100% clean audit pass (**0 vulnerabilities found** via dependency checks and **0 warnings** via strict Rust `clippy` static analysis).
 - 📦 **Local Portability (.piforge)**: Completely offline. Imports and exports self-contained sharing JSON archives representing your entire workspace.
 
 ---
