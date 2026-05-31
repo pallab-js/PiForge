@@ -1,0 +1,30 @@
+# SvelteKit and Vite
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# System & OS Files
+.DS_Store
+Thumbs.db
+
+# Databases & local stores
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+piforge.db
+piforge.db-journal
+
+# Tauri builds and logs
+dist
+src-tauri/target
+src-tauri/gen/schemas
+.tauri
+src-tauri/piforge.db
+src-tauri/piforge.db-journal

@@ -1,0 +1,85 @@
+@import "tailwindcss";
+
+:root {
+  /* Surfaces */
+  --bg-base:            #111110;   /* deepest background (window base) */
+  --bg-surface:         #181715;   /* primary panels */
+  --bg-elevated:        #1f1e1b;   /* cards, dropdowns, overlays */
+  --bg-card:            #252320;   /* input fields, list items */
+  --bg-hover:           #2e2c28;   /* hover state on interactive items */
+  --bg-selected:        #332f2a;   /* selected item background */
+
+  /* Text */
+  --text-primary:       #faf9f5;   /* headings, primary labels */
+  --text-secondary:     #a09d96;   /* secondary labels, metadata */
+  --text-muted:         #6c6a64;   /* placeholders, disabled */
+  --text-inverse:       #141413;   /* text on coral/light surfaces */
+
+  /* Accent — Coral (primary) */
+  --accent-coral:       #cc785c;   /* primary CTA, active states */
+  --accent-coral-hover: #a9583e;   /* coral hover/active */
+  --accent-coral-dim:   rgba(204,120,92,0.15); /* coral glow/selection */
+
+  /* Accent — Teal (secondary) */
+  --accent-teal:        #5db8a6;   /* success, connection lines, links */
+  --accent-teal-dim:    rgba(93,184,166,0.15);
+
+  /* Accent — Amber (warning / highlight) */
+  --accent-amber:       #e8a55a;   /* warnings, priority badges */
+  --accent-amber-dim:   rgba(232,165,90,0.15);
+
+  /* Semantic */
+  --color-success:      #5db872;
+  --color-warning:      #d4a017;
+  --color-error:        #c64545;
+  --color-info:         #5db8a6;
+
+  /* Borders */
+  --border-subtle:      rgba(255,255,255,0.06);  /* hairline separators */
+  --border-default:     rgba(255,255,255,0.10);  /* card borders */
+  --border-strong:      rgba(255,255,255,0.18);  /* focused input borders */
+
+  /* Canvas-specific */
+  --canvas-bg:          #0e0d0c;   /* infinite canvas background */
+  --canvas-grid-dot:    rgba(255,255,255,0.08);
+  --canvas-selection:   rgba(204,120,92,0.25);
+
+  /* Graph-specific */
+  --graph-bg:           #0e0d0c;
+  --graph-edge:         rgba(255,255,255,0.25);
+  --graph-edge-active:  #cc785c;
+  --graph-node-bg:      #252320;
+  --graph-node-border:  rgba(255,255,255,0.12);
+
+  /* Typography */
+  --font-display: 'Fraunces', 'Cormorant Garamond', Georgia, serif;
+  --font-sans: 'DM Sans', 'Sohne', 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  margin: 0;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-card);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--bg-hover);
+}
