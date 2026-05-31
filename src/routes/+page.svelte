@@ -6,6 +6,8 @@
   import { BOARDS } from '../lib/rpi-boards';
   import AppShell from '../lib/components/layout/AppShell.svelte';
 
+  import { initCustomComponents } from '../lib/stores/components.store';
+
   // Dashboard state
   let searchQuery = $state('');
   let isCreateOpen = $state(false);
@@ -20,6 +22,7 @@
   onMount(async () => {
     await settings.init();
     await initProjects();
+    await initCustomComponents();
   });
 
   // Filter projects by search

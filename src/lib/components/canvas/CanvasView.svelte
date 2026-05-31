@@ -9,6 +9,18 @@
   import { BUILTIN_COMPONENTS } from '../../components-library';
   import * as ipc from '../../ipc';
   import type { CanvasNode, CanvasEdge, CanvasState } from '../../types';
+  import { 
+    isSimulating, 
+    nodeSimStates, 
+    boardPinStates, 
+    toggleSimulation, 
+    toggleBoardPin, 
+    updateNodeSimState, 
+    isEdgePowered, 
+    activeMacroName, 
+    startMacro, 
+    stopMacro 
+  } from '../../stores/simulation.store';
 
   // Toolbar active tool: 'select' | 'wire' | 'text' | 'sticky'
   let activeTool = $state<'select' | 'wire' | 'sticky'>('select');
@@ -25,6 +37,50 @@
 
   // Diagnostics Panel toggle state
   let showDiagnostics = $state(false);
+
+  // Wire routing style state
+  let isOrthogonal = $state(true);
+
+  function computeOrthogonalPath(x1: number, y1: number, x2: number, y2: number, radius = 8): string {
+    if (Math.abs(x1 - x2) < 2) return `M ${x1} ${y1} L ${x2} ${y2}`;
+    if (Math.abs(y1 - y2) < 2) return `M ${x1} ${y1} L ${x2} ${y2}`;
+
+    const midX = x1 + (x2 - x1) / 2;
+    const signX = Math.sign(x2 - x1);
+    const signY = Math.sign(y2 - y1);
+    const r = Math.min(radius, Math.abs(midX - x1), Math.abs(y2 - y1) / 2);
+
+    const p1x = midX - signX * r;
+    const p1y = y1;
+    const c1x = midX;
+    const c1y = y1;
+    const p2x = midX;
+    const p2y = y1 + signY * r;
+
+    const p3x = midX;
+    const p3y = y2 - signY * r;
+    const c2x = midX;
+    const c2y = y2;
+    const p4x = midX + signX * r;
+    const p4y = y2;
+
+    return `M ${x1} ${y1} L ${p1x} ${p1y} Q ${c1x} ${c1y}, ${p2x} ${p2y} L ${p3x} ${p3y} Q ${c2x} ${c2y}, ${p4x} ${p4y} L ${x2} ${y2}`;
+  }
+
+  function updateWireProperty(edgeId: string, updates: Partial<CanvasEdge>) {
+    activeCanvasState.update(state => {
+      if (!state) return state;
+      const edges = state.edges.map(edge => {
+        if (edge.id === edgeId) {
+          return { ...edge, ...updates };
+        }
+        return edge;
+      });
+      const next = { ...state, edges };
+      updateCanvasStateDirectly(next);
+      return next;
+    });
+  }
 
   // Hardware Diagnostics & Conflicts Validator
   interface DiagnosticIssue {
@@ -545,25 +601,57 @@
           {@const x2 = dst.x + (edge.targetPinId ? 15 : dst.width/2)}
           {@const y2 = dst.y + (edge.targetPinId ? 15 : dst.height/2)}
           
-          <!-- Bezier curved wires -->
-          {@const cx1 = x1 + (x2 - x1) / 2}
-          {@const cy1 = y1}
-          {@const cx2 = x1 + (x2 - x1) / 2}
-          {@const cy2 = y2}
+          {@const midX = x1 + (x2 - x1) / 2}
+          {@const isPowered = $isSimulating && isEdgePowered(edge.id, $activeCanvasState)}
+          {@const pathD = isOrthogonal 
+            ? computeOrthogonalPath(x1, y1, x2, y2) 
+            : `M ${x1} ${y1} C ${x1 + (x2 - x1)/2} ${y1}, ${x1 + (x2 - x1)/2} ${y2}, ${x2} ${y2}`}
 
           <path 
-            d="M {x1} {y1} C {cx1} {cy1}, {cx2} {cy2}, {x2} {y2}" 
+            d={pathD} 
             fill="none" 
-            stroke={edge.id === $selectedEdgeId ? 'var(--accent-coral)' : edge.color || '#5db8a6'} 
-            stroke-width={edge.id === $selectedEdgeId ? 4 : 2} 
+            stroke={edge.id === $selectedEdgeId 
+              ? 'var(--accent-coral)' 
+              : isPowered 
+                ? '#e8a55a' 
+                : edge.color || '#5db8a6'} 
+            stroke-width={edge.id === $selectedEdgeId ? 4 : isPowered ? 3.5 : 2} 
             stroke-dasharray={edge.style === 'dashed' ? '5,5' : 'none'}
-            class="cursor-pointer hover:stroke-[var(--accent-coral)] transition-colors"
+            class="cursor-pointer hover:stroke-[var(--accent-coral)] transition-all {isPowered ? 'animate-pulse drop-shadow-[0_0_8px_rgba(232,165,90,0.8)]' : ''}"
             onmousedown={(e) => {
               e.stopPropagation();
               selectedEdgeId.set(edge.id);
               selectedNodeId.set(null);
             }}
           />
+
+          <!-- Net Label overlay on wire with clean background mask -->
+          {#if edge.label}
+            {@const labelX = isOrthogonal ? midX : x1 + (x2 - x1) / 2}
+            {@const labelY = (y1 + y2) / 2}
+            <g class="pointer-events-none select-none">
+              <!-- Background mask -->
+              <rect 
+                x={labelX - (edge.label.length * 2.5) - 3} 
+                y={labelY - 5} 
+                width={(edge.label.length * 5) + 6} 
+                height={10} 
+                fill="var(--canvas-bg)" 
+                rx="2"
+              />
+              <text 
+                x={labelX} 
+                y={labelY + 2.5} 
+                fill="var(--text-secondary)" 
+                font-size="7" 
+                font-family="monospace" 
+                font-weight="bold"
+                text-anchor="middle"
+              >
+                {edge.label}
+              </text>
+            </g>
+          {/if}
         {/if}
       {/each}
     </svg>
@@ -599,15 +687,26 @@
                 <!-- Quick interactive pin row -->
                 <div class="flex gap-0.5 mt-2 flex-wrap max-w-[180px] justify-center">
                   {#each Array(40) as _, i}
+                    {@const pinNum = (i + 1).toString()}
+                    {@const isPinHigh = $isSimulating && $boardPinStates[pinNum] === 1}
                     <button 
-                      onclick={(e) => handlePinClick(e, node.id, (i + 1).toString())}
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        if ($isSimulating) {
+                          toggleBoardPin(pinNum);
+                        } else {
+                          handlePinClick(e, node.id, pinNum);
+                        }
+                      }}
                       class="w-2.5 h-2.5 rounded-sm text-[6px] flex items-center justify-center border font-mono select-none transition-colors cursor-pointer
-                        {wireStartPinId === (i+1).toString() && wireStartNodeId === node.id 
+                        {wireStartPinId === pinNum && wireStartNodeId === node.id 
                           ? 'bg-[var(--accent-coral)] border-[var(--text-primary)] text-[var(--text-inverse)]' 
-                          : 'bg-[var(--bg-elevated)] border-[var(--border-default)] text-[var(--text-secondary)] hover:bg-[var(--accent-coral)]'}"
-                      title={`Physical Pin ${i+1}`}
+                          : isPinHigh
+                            ? 'bg-[#e8a55a] border-[var(--text-primary)] text-black font-bold shadow-lg scale-110'
+                            : 'bg-[var(--bg-elevated)] border-[var(--border-default)] text-[var(--text-secondary)] hover:bg-[var(--accent-coral)]'}"
+                      title={$isSimulating ? `Physical Pin ${pinNum} (Click to toggle High/Low)` : `Physical Pin ${pinNum}`}
                     >
-                      {i + 1}
+                      {pinNum}
                     </button>
                   {/each}
                 </div>
@@ -617,27 +716,163 @@
           <!-- ACCESSORIES HARDWARE COMPONENT -->
           {:else if node.type === 'component'}
             {@const comp = BUILTIN_COMPONENTS.find(c => c.id === node.componentId)}
-            <div class="flex flex-col h-full w-full p-2.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="text-lg">{comp?.icon_svg || '🔌'}</span>
-                <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
-              </div>
-              <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+            <div class="flex flex-col h-full w-full p-2.5 justify-between">
               
+              {#if node.componentId === 'led'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg transition-all duration-300 { $isSimulating && $nodeSimStates[node.id]?.lit ? 'scale-125 animate-pulse drop-shadow-[0_0_8px_rgba(239,68,68,0.8)]' : '' }">
+                    { $isSimulating && $nodeSimStates[node.id]?.lit ? '🔴' : '⚫' }
+                  </span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating && $nodeSimStates[node.id]?.lit}
+                  <span class="text-[9px] text-[var(--accent-coral)] font-bold animate-pulse text-center">✨ Glowing Active (3.3V)</span>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'button'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">{comp?.icon_svg || '🔘'}</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating}
+                  <button 
+                    onmousedown={() => updateNodeSimState(node.id, { pressed: true })}
+                    onmouseup={() => updateNodeSimState(node.id, { pressed: false })}
+                    onmouseleave={() => updateNodeSimState(node.id, { pressed: false })}
+                    class="w-full py-1 bg-[var(--accent-coral)] hover:bg-[var(--accent-coral-hover)] text-[var(--text-inverse)] text-[10px] font-bold rounded cursor-pointer select-none transition-transform active:scale-95 text-center"
+                  >
+                    { $nodeSimStates[node.id]?.pressed ? '🔴 PRESSING...' : '🔘 CLICK & HOLD' }
+                  </button>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'buzzer'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg transition-transform { $isSimulating && $nodeSimStates[node.id]?.active ? 'animate-bounce' : '' }">
+                    { $isSimulating && $nodeSimStates[node.id]?.active ? '🔊' : '🔕' }
+                  </span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating && $nodeSimStates[node.id]?.active}
+                  <span class="text-[9px] text-[var(--accent-amber)] font-bold animate-pulse text-center">🔊 BEEPING ACTIVE</span>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'servo'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">⚙️</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating}
+                  <div class="flex flex-col gap-1 w-full mt-1">
+                    <div class="flex items-center justify-between text-[8px] font-mono text-[var(--text-secondary)]">
+                      <span>Shaft Angle:</span>
+                      <span class="font-bold text-[var(--accent-coral)]">{$nodeSimStates[node.id]?.angle || 90}°</span>
+                    </div>
+                    <div class="w-full bg-[var(--bg-elevated)] h-1.5 rounded-full overflow-hidden relative">
+                      <div class="bg-[var(--accent-coral)] h-full transition-all duration-150" style="width: {(($nodeSimStates[node.id]?.angle || 90) / 180) * 100}%"></div>
+                    </div>
+                  </div>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'oled' || node.componentId === 'lcd1602'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">{comp?.icon_svg || '📺'}</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating && $nodeSimStates[node.id]?.isOn}
+                  <div class="w-full bg-black border border-[var(--accent-teal)] rounded p-1 font-mono text-[7px] text-[var(--accent-teal)] leading-tight h-10 select-none overflow-hidden flex flex-col justify-center">
+                    {#each ($nodeSimStates[node.id]?.text || []) as textLine}
+                      <div class="truncate">{textLine}</div>
+                    {/each}
+                  </div>
+                {:else if $isSimulating}
+                  <div class="w-full bg-neutral-900 border border-neutral-700 rounded p-1 font-mono text-[7px] text-neutral-500 italic leading-tight h-10 select-none flex items-center justify-center">
+                    Unpowered Display
+                  </div>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'rotary'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">🔄</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating}
+                  <div class="flex items-center gap-2 mt-1 w-full justify-between">
+                    <button 
+                      onclick={() => updateNodeSimState(node.id, { steps: ($nodeSimStates[node.id]?.steps || 0) - 1 })}
+                      class="px-1 py-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded text-[8px] font-bold text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                    >
+                      ◀ CW
+                    </button>
+                    <span class="text-[9px] font-mono font-bold text-[var(--accent-coral)]">{$nodeSimStates[node.id]?.steps || 0}</span>
+                    <button 
+                      onclick={() => updateNodeSimState(node.id, { steps: ($nodeSimStates[node.id]?.steps || 0) + 1 })}
+                      class="px-1 py-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded text-[8px] font-bold text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                    >
+                      CCW ▶
+                    </button>
+                  </div>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else if node.componentId === 'dht22' || node.componentId === 'ds18b20'}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">🌡️</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                {#if $isSimulating}
+                  <div class="flex flex-col gap-1 mt-1 w-full">
+                    <div class="flex items-center justify-between text-[8px] font-mono">
+                      <span>Temp:</span>
+                      <span class="font-bold text-[var(--accent-teal)]">{$nodeSimStates[node.id]?.temp || 24.5}°C</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="0" 
+                      max="50" 
+                      step="0.5"
+                      value={$nodeSimStates[node.id]?.temp || 24.5} 
+                      oninput={(e) => updateNodeSimState(node.id, { temp: parseFloat((e.target as HTMLInputElement).value) })}
+                      class="w-full accent-[var(--accent-teal)] h-1 cursor-pointer bg-neutral-800 rounded"
+                    />
+                  </div>
+                {:else}
+                  <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+                {/if}
+
+              {:else}
+                <div class="flex items-center gap-1.5 mb-1">
+                  <span class="text-lg">{comp?.icon_svg || '🔌'}</span>
+                  <span class="text-xs font-bold text-[var(--text-primary)] truncate">{node.label}</span>
+                </div>
+                <p class="text-[9px] text-[var(--text-secondary)] line-clamp-2 leading-snug">{comp?.description || 'Custom Wiring Component'}</p>
+              {/if}
+
               <div class="flex-1"></div>
               
               <!-- Component Pin nodes -->
               <div class="flex gap-1 justify-end border-t border-[var(--border-subtle)] pt-1.5 mt-1 select-none">
                 {#each Array(comp?.pin_count || 2) as _, i}
+                  {@const pinStr = (i + 1).toString()}
                   <button 
-                    onclick={(e) => handlePinClick(e, node.id, (i + 1).toString())}
+                    onclick={(e) => handlePinClick(e, node.id, pinStr)}
                     class="w-3.5 h-3.5 rounded text-[8px] font-bold border flex items-center justify-center font-mono select-none cursor-pointer transition-colors
-                      {wireStartPinId === (i+1).toString() && wireStartNodeId === node.id 
+                      {wireStartPinId === pinStr && wireStartNodeId === node.id 
                         ? 'bg-[var(--accent-coral)] border-[var(--text-primary)] text-[var(--text-inverse)]' 
                         : 'bg-[var(--bg-elevated)] border-[var(--border-default)] text-[var(--accent-teal)] hover:bg-[var(--accent-teal)] hover:text-black'}"
-                    title={`Component Pin ${i+1}`}
+                    title={`Component Pin ${pinStr}`}
                   >
-                    P{i + 1}
+                    P{pinStr}
                   </button>
                 {/each}
               </div>
@@ -663,6 +898,25 @@
 
   <!-- Left Float toolbar pill -->
   <div class="absolute left-4 top-1/2 -translate-y-1/2 flex flex-col bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-2xl p-1.5 gap-1.5 z-[90] select-none">
+    <button 
+      onclick={toggleSimulation}
+      class="w-8 h-8 rounded-lg flex items-center justify-center text-xs transition-colors cursor-pointer
+        {$isSimulating ? 'bg-[var(--accent-teal-dim)] text-[var(--accent-teal)] border border-[var(--accent-teal)] font-bold scale-110 shadow-lg' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}"
+      title="Toggle Circuit Simulation (⚡)"
+      aria-label="Toggle simulation"
+    >
+      ⚡
+    </button>
+    <button 
+      onclick={() => isOrthogonal = !isOrthogonal}
+      class="w-8 h-8 rounded-lg flex items-center justify-center text-xs transition-colors cursor-pointer
+        {isOrthogonal ? 'bg-[var(--accent-coral-dim)] text-[var(--accent-coral)] border border-[var(--accent-coral)] font-bold shadow-md scale-110' : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'}"
+      title="Toggle Orthogonal Wire Routing (📐)"
+      aria-label="Toggle orthogonal wire routing"
+    >
+      📐
+    </button>
+    <div class="h-[1px] bg-[var(--border-subtle)] mx-1"></div>
     <button 
       onclick={() => { activeTool = 'select'; wireStartNodeId = null; }}
       class="w-8 h-8 rounded-lg flex items-center justify-center text-xs transition-colors cursor-pointer
@@ -745,6 +999,37 @@
     </div>
   {/if}
 
+  <!-- AUTOMATED MACROS / FIRMWARE TEST LOOPS PANEL -->
+  {#if $isSimulating}
+    <div class="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-2xl px-4 py-2 z-[90] select-none animate-slide-down">
+      <span class="text-xs font-serif font-bold text-[var(--accent-teal)]">⚡ Logic Simulation Active</span>
+      <div class="h-4 w-[1px] bg-[var(--border-subtle)]"></div>
+      
+      {#if $activeMacroName === null}
+        <button 
+          onclick={() => startMacro('blink')}
+          class="px-2.5 py-1 bg-[var(--bg-elevated)] hover:bg-[var(--accent-teal)] hover:text-black border border-[var(--border-default)] text-[10px] font-bold rounded cursor-pointer transition-colors"
+        >
+          ▶ Run LED Blink script
+        </button>
+        <button 
+          onclick={() => startMacro('sweep')}
+          class="px-2.5 py-1 bg-[var(--bg-elevated)] hover:bg-[var(--accent-teal)] hover:text-black border border-[var(--border-default)] text-[10px] font-bold rounded cursor-pointer transition-colors"
+        >
+          ▶ Run Servo Sweep script
+        </button>
+      {:else}
+        <span class="text-[10px] font-mono text-[var(--text-secondary)] animate-pulse">Running script: {$activeMacroName}...</span>
+        <button 
+          onclick={stopMacro}
+          class="px-2.5 py-1 bg-[var(--color-error)] text-[var(--text-inverse)] hover:bg-[var(--color-error)]/80 text-[10px] font-bold rounded cursor-pointer transition-colors"
+        >
+          ⏹ Stop Script
+        </button>
+      {/if}
+    </div>
+  {/if}
+
   <!-- REAL-TIME HARDWARE DIAGNOSTICS & CONFLICTS OVERLAY -->
   <div class="absolute right-4 top-4 flex flex-col items-end gap-2 z-[90] select-none">
     <!-- Float Badge -->
@@ -792,4 +1077,69 @@
       </div>
     {/if}
   </div>
+
+  <!-- FLOATING WIRE STYLE CUSTOMIZER -->
+  {#if $selectedEdgeId}
+    {@const selectedEdge = $activeCanvasState.edges.find(e => e.id === $selectedEdgeId)}
+    {#if selectedEdge}
+      <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-2xl px-4 py-2 z-[90] select-none animate-slide-up">
+        <span class="text-xs font-serif font-bold text-[var(--accent-coral)]">🔌 Wire Net Properties</span>
+        <div class="h-4 w-[1px] bg-[var(--border-subtle)]"></div>
+        
+        <!-- Label input -->
+        <div class="flex items-center gap-1.5">
+          <label class="text-[9px] font-bold text-[var(--text-secondary)] uppercase" for="wire-label">Net Name:</label>
+          <input 
+            type="text" 
+            id="wire-label"
+            value={selectedEdge.label || ''} 
+            oninput={(e) => updateWireProperty(selectedEdge.id, { label: (e.target as HTMLInputElement).value })}
+            placeholder="e.g. SPI_MOSI..."
+            class="w-24 bg-[var(--bg-card)] border border-[var(--border-default)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text-primary)] outline-none focus:border-[var(--accent-coral)]"
+          />
+        </div>
+        
+        <div class="h-4 w-[1px] bg-[var(--border-subtle)]"></div>
+        
+        <!-- Color Picker presets -->
+        <div class="flex items-center gap-1">
+          {#each [
+            { name: 'Red', hex: '#ef4444', title: '5V Power' },
+            { name: 'Orange', hex: '#f97316', title: '3.3V Power' },
+            { name: 'Teal', hex: '#5db8a6', title: 'GPIO/Signal' },
+            { name: 'Violet', hex: '#9d7adc', title: 'Data/Bus' },
+            { name: 'Grey', hex: '#6c6a64', title: 'GND Ground' }
+          ] as colorPreset}
+            <button 
+              onclick={() => updateWireProperty(selectedEdge.id, { color: colorPreset.hex })}
+              class="w-4 h-4 rounded-full border border-black/25 cursor-pointer hover:scale-110 transition-transform"
+              style="background-color: {colorPreset.hex}"
+              title={colorPreset.title}
+              aria-label={colorPreset.title}
+            ></button>
+          {/each}
+        </div>
+        
+        <div class="h-4 w-[1px] bg-[var(--border-subtle)]"></div>
+        
+        <!-- Line Style switcher -->
+        <button 
+          onclick={() => updateWireProperty(selectedEdge.id, { style: selectedEdge.style === 'dashed' ? 'solid' : 'dashed' })}
+          class="px-2 py-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded text-[9px] font-bold hover:bg-[var(--bg-hover)] cursor-pointer text-[var(--text-primary)]"
+        >
+          Style: {selectedEdge.style === 'dashed' ? 'Dashed ╌' : 'Solid ──'}
+        </button>
+        
+        <div class="h-4 w-[1px] bg-[var(--border-subtle)]"></div>
+        
+        <!-- Delete wire button -->
+        <button 
+          onclick={handleDeleteSelected}
+          class="px-2 py-0.5 bg-[var(--color-error)] text-[var(--text-inverse)] rounded text-[9px] font-bold hover:bg-[var(--color-error)]/80 cursor-pointer"
+        >
+          ✕ Delete Wire
+        </button>
+      </div>
+    {/if}
+  {/if}
 </div>

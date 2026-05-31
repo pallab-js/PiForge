@@ -71,22 +71,24 @@
       });
     });
 
-    // 5. Add default dependency edges (tasks that connect or link)
-    // Connect tasks to components if related
-    tasks.forEach((t, i) => {
-      // Create some demo task dependencies to show graph connections automatically
-      if (i > 0 && tasks[i-1]) {
+    // 5. Add actual dependency edges from labels
+    tasks.forEach(t => {
+      const prereqIds = t.labels
+        .filter(l => l.startsWith('dep:'))
+        .map(l => l.substring(4));
+
+      prereqIds.forEach(pId => {
         elements.push({
           data: {
-            id: `dep_${t.id}_${tasks[i-1].id}`,
-            source: tasks[i-1].id,
+            id: `dep_${t.id}_${pId}`,
+            source: pId,
             target: t.id,
             label: 'depends_on',
             type: 'dependency',
-            color: 'rgba(255,255,255,0.15)'
+            color: '#cc785c' // Coral color for active task dependency
           }
         });
-      }
+      });
     });
 
     return elements;

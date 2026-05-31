@@ -182,9 +182,9 @@
               <!-- Title -->
               <td class="p-3 font-medium text-[var(--text-primary)]">
                 {task.title}
-                {#if task.labels && task.labels.length > 0}
+                {#if task.labels && task.labels.filter(l => !l.startsWith('dep:')).length > 0}
                   <span class="inline-flex gap-1 ml-2">
-                    {#each task.labels as label}
+                    {#each task.labels.filter(l => !l.startsWith('dep:')) as label}
                       <span class="px-1.5 py-0.5 bg-[var(--bg-card)] border border-[var(--border-default)] rounded text-[9px] text-[var(--text-secondary)] font-normal font-mono select-none">
                         {label}
                       </span>

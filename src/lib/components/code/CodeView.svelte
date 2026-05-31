@@ -1,9 +1,12 @@
 <!-- svelte-ignore a11y_no_static_element_interactions a11y-no-static-element-interactions -->
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import { activeCanvasState, activeProject } from '../../stores/project.store';
   import { addToast } from '../../stores/ui.store';
   import { RPI_40PIN_HEADER, RPI_PICO_HEADER } from '../../rpi-boards';
   import { BUILTIN_COMPONENTS } from '../../components-library';
+  import * as ipc from '../../ipc';
 
   let selectedLang = $state<'gpiozero' | 'rpigpio' | 'wiringpi'>('gpiozero');
 
@@ -359,6 +362,78 @@ ${loopLines.length > 0 ? loopLines.join('\n') : '    delay(1000);'}
     URL.revokeObjectURL(url);
     addToast('Template script downloaded!', 'success');
   }
+
+  // SSH Remote Deployer States
+  let piIp = $state('raspberrypi.local');
+  let piUser = $state('pi');
+  let piAuthMethod = $state<'password' | 'key'>('key');
+  let piPasswordOrKey = $state('/Users/pallabpc/.ssh/id_rsa');
+  let isDeploying = $state(false);
+  let isExecuting = $state(false);
+  let piConsoleLogs = $state<string[]>(['PiForge Remote Console initialized.', 'Status: Ready to deploy.']);
+
+  let consoleContainerEl = $state<HTMLElement | null>(null);
+
+  // Hook event listener on mount
+  onMount(() => {
+    let unlistenFn: any = null;
+    
+    const setupListener = async () => {
+      unlistenFn = await listen<string>('pi-console-log', (event) => {
+        piConsoleLogs = [...piConsoleLogs, event.payload];
+        // Auto scroll terminal log window
+        setTimeout(() => {
+          if (consoleContainerEl) {
+            consoleContainerEl.scrollTop = consoleContainerEl.scrollHeight;
+          }
+        }, 30);
+      });
+    };
+
+    setupListener();
+
+    return () => {
+      if (unlistenFn) unlistenFn();
+    };
+  });
+
+  async function handleRemoteDeploy() {
+    if (isDeploying || isExecuting) return;
+    isDeploying = true;
+    piConsoleLogs = ['[SYSTEM] Establishing remote connection...', `[SYSTEM] Deploying script to Pi at ${piIp}...`];
+    
+    try {
+      const result = await ipc.deployAndRunPi(
+        piIp,
+        piUser,
+        piPasswordOrKey,
+        piAuthMethod,
+        compiledCode,
+        'piforge_scaffold.py'
+      );
+      addToast(result, 'success');
+      piConsoleLogs = [...piConsoleLogs, `[SUCCESS] ${result}`, '[SYSTEM] Spawning process. Telemetry active:'];
+      isExecuting = true;
+    } catch (e) {
+      console.error(e);
+      addToast('Deployment failed', 'error');
+      piConsoleLogs = [...piConsoleLogs, `[ERROR] Failed to deploy: ${e}`];
+    } finally {
+      isDeploying = false;
+    }
+  }
+
+  async function handleStopExecution() {
+    try {
+      const result = await ipc.stopPiExecution();
+      addToast(result, 'info');
+      piConsoleLogs = [...piConsoleLogs, `[SYSTEM] ${result}`];
+      isExecuting = false;
+    } catch (e) {
+      console.error(e);
+      addToast('Failed to stop execution', 'error');
+    }
+  }
 </script>
 
 <div class="flex flex-col h-full w-full bg-[var(--bg-base)] select-none">
@@ -392,12 +467,14 @@ ${loopLines.length > 0 ? loopLines.join('\n') : '    delay(1000);'}
     </div>
   </div>
 
-  <!-- Code Block editor display pane -->
-  <div class="flex-1 overflow-auto p-4 select-text">
-    <div class="relative bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-lg overflow-hidden h-full flex flex-col font-mono text-xs">
-      <div class="flex items-center h-8 px-4 bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] justify-between select-none">
+  <!-- Content pane (Split left code, right Remote deployer) -->
+  <div class="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 p-4 min-h-0">
+    
+    <!-- LEFT: Code editor view (Col 7) -->
+    <div class="lg:col-span-7 bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-md overflow-hidden flex flex-col h-full font-mono text-xs">
+      <div class="flex items-center h-9 px-4 bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] justify-between select-none">
         <span class="text-[10px] uppercase font-bold text-[var(--text-muted)] tracking-wider">
-          {selectedLang === 'wiringpi' ? 'C++' : 'Python'} Terminal Output
+          Scaffold Script Output
         </span>
         <div class="flex gap-1.5">
           <span class="w-2.5 h-2.5 rounded-full bg-[var(--color-error)] opacity-35"></span>
@@ -406,9 +483,117 @@ ${loopLines.length > 0 ? loopLines.join('\n') : '    delay(1000);'}
         </div>
       </div>
 
-      <pre class="flex-1 p-4 overflow-auto text-[var(--text-secondary)] leading-relaxed selection:bg-[var(--accent-coral-dim)]">
+      <pre class="flex-1 p-4 overflow-auto text-[var(--text-secondary)] leading-relaxed selection:bg-[var(--accent-coral-dim)] select-text">
         <code>{compiledCode}</code>
       </pre>
     </div>
+
+    <!-- RIGHT: Remote deployer & log terminal (Col 5) -->
+    <div class="lg:col-span-5 flex flex-col gap-4 h-full min-h-0">
+      
+      <!-- Connection Form -->
+      <div class="bg-[var(--bg-surface)] border border-[var(--border-default)] rounded-xl shadow-md p-4 flex flex-col gap-3">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-[var(--accent-teal)]">🔌 Live-Pi Connection Bridge</h3>
+        
+        <div class="grid grid-cols-2 gap-3">
+          <div class="flex flex-col gap-1">
+            <label class="text-[9px] font-bold text-[var(--text-secondary)] uppercase" for="pi-ip">Pi IP / Hostname</label>
+            <input 
+              type="text" 
+              id="pi-ip"
+              bind:value={piIp} 
+              placeholder="e.g. raspberrypi.local"
+              class="bg-[var(--bg-card)] border border-[var(--border-default)] rounded px-2.5 py-1 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-teal)]"
+            />
+          </div>
+          
+          <div class="flex flex-col gap-1">
+            <label class="text-[9px] font-bold text-[var(--text-secondary)] uppercase" for="pi-user">SSH Username</label>
+            <input 
+              type="text" 
+              id="pi-user"
+              bind:value={piUser} 
+              placeholder="e.g. pi"
+              class="bg-[var(--bg-card)] border border-[var(--border-default)] rounded px-2.5 py-1 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-teal)]"
+            />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div class="flex flex-col gap-1">
+            <label class="text-[9px] font-bold text-[var(--text-secondary)] uppercase" for="pi-auth">Authentication</label>
+            <select 
+              id="pi-auth"
+              bind:value={piAuthMethod}
+              class="bg-[var(--bg-card)] border border-[var(--border-default)] rounded px-2.5 py-1 text-xs text-[var(--text-primary)] outline-none cursor-pointer"
+            >
+              <option value="key">Private Key Auth</option>
+              <option value="password">SSH Password</option>
+            </select>
+          </div>
+          
+          <div class="flex flex-col gap-1">
+            <label class="text-[9px] font-bold text-[var(--text-secondary)] uppercase" for="pi-cred">
+              {piAuthMethod === 'key' ? 'RSA Key Path' : 'SSH Password'}
+            </label>
+            <input 
+              type={piAuthMethod === 'key' ? 'text' : 'password'} 
+              id="pi-cred"
+              bind:value={piPasswordOrKey} 
+              placeholder={piAuthMethod === 'key' ? 'e.g. ~/.ssh/id_rsa' : '••••••••'}
+              class="bg-[var(--bg-card)] border border-[var(--border-default)] rounded px-2.5 py-1 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-teal)]"
+            />
+          </div>
+        </div>
+
+        <!-- Deploy Action Trigger Buttons -->
+        <div class="flex gap-2.5 mt-2">
+          {#if isExecuting}
+            <button 
+              onclick={handleStopExecution}
+              class="flex-1 py-1.5 bg-[var(--color-error)] text-[var(--text-inverse)] hover:bg-[var(--color-error)]/80 text-xs font-semibold rounded-lg cursor-pointer transition-all hover:scale-[1.02] text-center"
+            >
+              ⏹ Stop Remote Execution
+            </button>
+          {:else}
+            <button 
+              onclick={handleRemoteDeploy}
+              disabled={isDeploying}
+              class="flex-1 py-1.5 bg-[var(--accent-teal)] text-black hover:bg-[var(--accent-teal)]/90 disabled:opacity-50 text-xs font-semibold rounded-lg cursor-pointer transition-all hover:scale-[1.02] text-center uppercase tracking-wide"
+            >
+              {isDeploying ? '🚀 DEPLOYING...' : '🚀 DEPLOY & RUN SCRIPT'}
+            </button>
+          {/if}
+        </div>
+      </div>
+
+      <!-- Real-time SSH Black Console -->
+      <div class="flex-1 bg-neutral-950 border border-neutral-900 rounded-xl shadow-2xl p-4 flex flex-col font-mono text-[10px] min-h-0">
+        <div class="flex items-center justify-between pb-2 border-b border-neutral-900 select-none shrink-0">
+          <span class="text-[9px] font-bold text-neutral-500 uppercase tracking-wider">Live Telemetry Terminal</span>
+          <span class="w-1.5 h-1.5 rounded-full {isExecuting ? 'bg-[var(--accent-teal)] animate-ping' : 'bg-neutral-800'}"></span>
+        </div>
+        
+        <!-- Live scrolling logs -->
+        <div 
+          bind:this={consoleContainerEl}
+          class="flex-1 overflow-y-auto mt-3 flex flex-col gap-1.5 pr-1 text-neutral-400 select-text leading-relaxed"
+        >
+          {#each piConsoleLogs as logLine}
+            {#if logLine.startsWith('[ERROR]')}
+              <div class="text-red-400 font-semibold">{logLine}</div>
+            {:else if logLine.startsWith('[SUCCESS]')}
+              <div class="text-[var(--accent-teal)] font-semibold">{logLine}</div>
+            {:else if logLine.startsWith('[SYSTEM]')}
+              <div class="text-neutral-500 italic">{logLine}</div>
+            {:else}
+              <div class="text-neutral-200">{logLine}</div>
+            {/if}
+          {/each}
+        </div>
+      </div>
+
+    </div>
+
   </div>
 </div>

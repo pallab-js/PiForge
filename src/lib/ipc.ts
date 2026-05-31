@@ -665,3 +665,84 @@ export async function saveSettings(settings: UserSettings): Promise<void> {
 
   mockDb.settings = settings;
 }
+
+// CUSTOM COMPONENTS OPERATIONS
+export async function listCustomComponents(): Promise<LibraryComponent[]> {
+  if (isTauri()) {
+    try {
+      return await invoke<LibraryComponent[]>('list_custom_components');
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
+  return mockDb.components;
+}
+
+export async function saveCustomComponent(component: LibraryComponent): Promise<LibraryComponent> {
+  if (isTauri()) {
+    try {
+      return await invoke<LibraryComponent>('save_custom_component', { component });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
+
+  const list = mockDb.components;
+  const index = list.findIndex(c => c.id === component.id);
+  if (index >= 0) {
+    list[index] = component;
+  } else {
+    list.push(component);
+  }
+  mockDb.components = list;
+  return component;
+}
+
+export async function deleteCustomComponent(id: string): Promise<void> {
+  if (isTauri()) {
+    try {
+      return await invoke<void>('delete_custom_component', { id });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
+
+  mockDb.components = mockDb.components.filter(c => c.id !== id);
+}
+
+// REMOTE DEPLOY & SSH DAEMON BRIDGE OPERATIONS
+export async function deployAndRunPi(
+  ip: string,
+  username: string,
+  passwordOrKey: string,
+  authMethod: 'password' | 'key',
+  code: string,
+  filename: string
+): Promise<string> {
+  if (isTauri()) {
+    try {
+      return await invoke<string>('deploy_and_run_pi', {
+        ip,
+        username,
+        passwordOrKey,
+        authMethod,
+        code,
+        filename
+      });
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+  return Promise.reject('Remote Raspberry Pi SSH Deploy requires Tauri native desktop execution.');
+}
+
+export async function stopPiExecution(): Promise<string> {
+  if (isTauri()) {
+    try {
+      return await invoke<string>('stop_pi_execution');
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+  return Promise.resolve('Mock process stopped.');
+}

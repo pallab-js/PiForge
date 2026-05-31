@@ -1,9 +1,12 @@
 #![allow(non_snake_case)]
 
 use std::fs;
+use std::process::{Command, Stdio, Child};
+use std::io::{BufReader, BufRead};
+use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Emitter};
 
 // Custom unified error type
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +81,22 @@ pub struct UserSettings {
     font_size: String,
     grid_type: String,
     snap_to_grid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryComponent {
+    id: String,
+    name: String,
+    description: String,
+    category: String,
+    pin_count: i32,
+    icon_svg: String,
+    is_builtin: bool,
+    created_at: i64,
+}
+
+pub struct PiConnectionState {
+    pub child_process: Mutex<Option<Child>>,
 }
 
 // DB connection helper
@@ -165,6 +184,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS custom_components (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            category TEXT NOT NULL,
+            pin_count INTEGER NOT NULL,
+            icon_svg TEXT NOT NULL,
+            is_builtin INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
         )",
         [],
     )?;
@@ -553,6 +586,196 @@ async fn save_settings(app: AppHandle, settings: UserSettings) -> std::result::R
     Ok(())
 }
 
+#[tauri::command]
+async fn list_custom_components(app: AppHandle) -> std::result::Result<Vec<LibraryComponent>, String> {
+    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, description, category, pin_count, icon_svg, is_builtin, created_at FROM custom_components ORDER BY created_at DESC")
+        .map_err(|e| e.to_string())?;
+    
+    let list = stmt
+        .query_map([], |row| {
+            let is_builtin_int: i32 = row.get(6)?;
+            Ok(LibraryComponent {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                category: row.get(3)?,
+                pin_count: row.get(4)?,
+                icon_svg: row.get(5)?,
+                is_builtin: is_builtin_int == 1,
+                created_at: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    
+    Ok(list)
+}
+
+#[tauri::command]
+async fn save_custom_component(app: AppHandle, component: LibraryComponent) -> std::result::Result<LibraryComponent, String> {
+    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+    let is_builtin_int = if component.is_builtin { 1 } else { 0 };
+    
+    conn.execute(
+        "INSERT INTO custom_components (id, name, description, category, pin_count, icon_svg, is_builtin, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            category = EXCLUDED.category,
+            pin_count = EXCLUDED.pin_count,
+            icon_svg = EXCLUDED.icon_svg,
+            is_builtin = EXCLUDED.is_builtin",
+        params![
+            component.id,
+            component.name,
+            component.description,
+            component.category,
+            component.pin_count,
+            component.icon_svg,
+            is_builtin_int,
+            component.created_at,
+        ],
+    ).map_err(|e| e.to_string())?;
+    
+    Ok(component)
+}
+
+#[tauri::command]
+async fn delete_custom_component(app: AppHandle, id: String) -> std::result::Result<(), String> {
+    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM custom_components WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn deploy_and_run_pi(
+    app: AppHandle,
+    state: tauri::State<'_, PiConnectionState>,
+    ip: String,
+    username: String,
+    password_or_key: String,
+    auth_method: String, // "password" | "key"
+    code: String,
+    filename: String,
+) -> std::result::Result<String, String> {
+    // 1. Kill any existing active process
+    {
+        let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
+        if let Some(mut child) = child_lock.take() {
+            let _ = child.kill();
+        }
+    }
+
+    // 2. Write code to a local temp file on host
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| Error::Tauri(e.to_string()).to_string())?;
+    
+    let temp_filepath = app_dir.join(&filename);
+    std::fs::write(&temp_filepath, code).map_err(|e| e.to_string())?;
+
+    // 3. Construct SCP command to copy file to Pi
+    let destination = format!("{}@{}:/home/{}/{}", username, ip, username, filename);
+    
+    let mut scp_args = vec![
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=5",
+    ];
+    
+    let key_path_str;
+    if auth_method == "key" && !password_or_key.is_empty() {
+        key_path_str = password_or_key.clone();
+        scp_args.push("-i");
+        scp_args.push(&key_path_str);
+    }
+    
+    let temp_path_str = temp_filepath.to_string_lossy().to_string();
+    scp_args.push(&temp_path_str);
+    scp_args.push(&destination);
+
+    let scp_status = Command::new("scp")
+        .args(&scp_args)
+        .status()
+        .map_err(|e| format!("Failed to copy file via SCP: {}", e))?;
+
+    if !scp_status.success() {
+        return Err("SCP file copy failed. Verify host IP, SSH service status, and credentials.".into());
+    }
+
+    // 4. Spawn SSH command to run file on Pi:
+    let mut ssh_args = vec![
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=5",
+    ];
+
+    if auth_method == "key" && !password_or_key.is_empty() {
+        ssh_args.push("-i");
+        ssh_args.push(&password_or_key);
+    }
+
+    let host = format!("{}@{}", username, ip);
+    ssh_args.push(&host);
+    
+    let run_cmd = format!("python3 -u /home/{}/{}", username, filename);
+    ssh_args.push(&run_cmd);
+
+    let mut child = Command::new("ssh")
+        .args(&ssh_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run SSH command: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
+
+    // 5. Store child process handle
+    {
+        let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
+        *child_lock = Some(child);
+    }
+
+    // 6. Spawn background threads to read stdout/stderr and emit Tauri events in real-time
+    let app_handle_stdout = app.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let _ = app_handle_stdout.emit("pi-console-log", l);
+            }
+        }
+    });
+
+    let app_handle_stderr = app.clone();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            if let Ok(l) = line {
+                let _ = app_handle_stderr.emit("pi-console-log", format!("[ERROR] {}", l));
+            }
+        }
+    });
+
+    Ok("Scaffold script deployed and executing on remote board!".into())
+}
+
+#[tauri::command]
+async fn stop_pi_execution(state: tauri::State<'_, PiConnectionState>) -> std::result::Result<String, String> {
+    let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
+    if let Some(mut child) = child_lock.take() {
+        let _ = child.kill();
+        Ok("Remote process execution halted.".into())
+    } else {
+        Ok("No remote process currently executing.".into())
+    }
+}
+
 // Build runner setup
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -561,6 +784,9 @@ pub fn run() {
         .setup(|app| {
             let conn = get_connection(app.handle())?;
             run_migrations(&conn)?;
+            app.manage(PiConnectionState {
+                child_process: Mutex::new(None),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -580,7 +806,12 @@ pub fn run() {
             save_notes,
             load_notes,
             get_settings,
-            save_settings
+            save_settings,
+            list_custom_components,
+            save_custom_component,
+            delete_custom_component,
+            deploy_and_run_pi,
+            stop_pi_execution
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
