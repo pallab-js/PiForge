@@ -653,6 +653,7 @@ async fn delete_custom_component(app: AppHandle, id: String) -> std::result::Res
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn deploy_and_run_pi(
     app: AppHandle,
     state: tauri::State<'_, PiConnectionState>,
@@ -745,20 +746,16 @@ async fn deploy_and_run_pi(
     let app_handle_stdout = app.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let _ = app_handle_stdout.emit("pi-console-log", l);
-            }
+        for l in reader.lines().map_while(|line| line.ok()) {
+            let _ = app_handle_stdout.emit("pi-console-log", l);
         }
     });
 
     let app_handle_stderr = app.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let _ = app_handle_stderr.emit("pi-console-log", format!("[ERROR] {}", l));
-            }
+        for l in reader.lines().map_while(|line| line.ok()) {
+            let _ = app_handle_stderr.emit("pi-console-log", format!("[ERROR] {}", l));
         }
     });
 
