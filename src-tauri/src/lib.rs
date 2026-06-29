@@ -1,12 +1,13 @@
-#![allow(non_snake_case)]
+pub mod models;
+pub mod db;
+pub mod deploy;
 
-use std::fs;
-use std::process::{Command, Stdio, Child};
-use std::io::{BufReader, BufRead};
-use std::sync::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Emitter};
+use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
+use tauri::{AppHandle, Manager};
+
+use db::{DbState, get_connection, run_migrations};
+use deploy::PiConnectionState;
 
 // Custom unified error type
 #[derive(Debug, thiserror::Error)]
@@ -29,179 +30,126 @@ impl Serialize for Error {
     }
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-// Models
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
-    id: String,
-    name: String,
-    description: String,
-    rpi_model: String,
-    status: String,
-    created_at: i64,
-    updated_at: i64,
-    color: String,
+// --- INPUT VALIDATIONS (SEC-04) ---
+
+fn validate_project(p: &models::Project) -> std::result::Result<(), String> {
+    if p.id.is_empty() || p.id.len() > 100 {
+        return Err("Invalid project ID".into());
+    }
+    if p.name.trim().is_empty() || p.name.len() > 200 {
+        return Err("Project name must be 1-200 characters".into());
+    }
+    if p.description.len() > 10000 {
+        return Err("Description must be under 10,000 characters".into());
+    }
+    if p.rpi_model.len() > 50 {
+        return Err("Invalid board model".into());
+    }
+    if p.status != "planning" && p.status != "active" && p.status != "archived" {
+        return Err("Invalid project status".into());
+    }
+    if !p.color.starts_with('#') || p.color.len() > 10 {
+        return Err("Invalid project color".into());
+    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    id: String,
-    project_id: String,
-    title: String,
-    description: String,
-    status: String,
-    priority: String,
-    labels: Vec<String>,
-    due_date: Option<i64>,
-    time_estimate: Option<i32>,
-    milestone_id: Option<String>,
-    canvas_node_id: Option<String>,
-    graph_node_id: Option<String>,
-    column_id: String,
-    position: f64,
-    created_at: i64,
-    updated_at: i64,
+fn validate_task(t: &models::Task) -> std::result::Result<(), String> {
+    if t.id.is_empty() || t.id.len() > 100 {
+        return Err("Invalid task ID".into());
+    }
+    if t.project_id.is_empty() || t.project_id.len() > 100 {
+        return Err("Invalid project ID in task".into());
+    }
+    if t.title.trim().is_empty() || t.title.len() > 200 {
+        return Err("Task title must be 1-200 characters".into());
+    }
+    if t.description.len() > 10000 {
+        return Err("Task description must be under 10,000 characters".into());
+    }
+    if t.status.len() > 50 {
+        return Err("Invalid task status".into());
+    }
+    if t.priority != "p0" && t.priority != "p1" && t.priority != "p2" && t.priority != "p3" {
+        return Err("Invalid task priority".into());
+    }
+    if t.column_id.len() > 100 {
+        return Err("Invalid column ID".into());
+    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Column {
-    id: String,
-    project_id: String,
-    name: String,
-    color: String,
-    position: f64,
-    is_done: bool,
+fn validate_column(c: &models::Column) -> std::result::Result<(), String> {
+    if c.id.is_empty() || c.id.len() > 100 {
+        return Err("Invalid column ID".into());
+    }
+    if c.project_id.is_empty() || c.project_id.len() > 100 {
+        return Err("Invalid project ID in column".into());
+    }
+    if c.name.trim().is_empty() || c.name.len() > 100 {
+        return Err("Column name must be 1-100 characters".into());
+    }
+    if c.color.len() > 50 {
+        return Err("Invalid column color".into());
+    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserSettings {
-    theme: String,
-    accent_color: String,
-    font_size: String,
-    grid_type: String,
-    snap_to_grid: bool,
+fn validate_canvas_state(state: &str) -> std::result::Result<(), String> {
+    if state.len() > 10 * 1024 * 1024 {
+        return Err("Canvas state too large (max 10MB)".into());
+    }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LibraryComponent {
-    id: String,
-    name: String,
-    description: String,
-    category: String,
-    pin_count: i32,
-    icon_svg: String,
-    is_builtin: bool,
-    created_at: i64,
+fn validate_notes(notes: &str) -> std::result::Result<(), String> {
+    if notes.len() > 1024 * 1024 {
+        return Err("Notes too large (max 1MB)".into());
+    }
+    Ok(())
 }
 
-pub struct PiConnectionState {
-    pub child_process: Mutex<Option<Child>>,
+fn validate_settings(s: &models::UserSettings) -> std::result::Result<(), String> {
+    if s.theme.len() > 50 || s.accent_color.len() > 50 || s.font_size.len() > 50 || s.grid_type.len() > 50 {
+        return Err("Invalid settings value length".into());
+    }
+    Ok(())
 }
 
-// DB connection helper
-fn get_connection(app: &AppHandle) -> Result<Connection> {
-    let app_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| Error::Tauri(e.to_string()))?;
-    
-    fs::create_dir_all(&app_dir)?;
-    let db_path = app_dir.join("piforge.db");
-    let conn = Connection::open(db_path)?;
-    Ok(conn)
+fn validate_custom_component(c: &models::LibraryComponent) -> std::result::Result<(), String> {
+    if c.id.is_empty() || c.id.len() > 100 {
+        return Err("Invalid component ID".into());
+    }
+    if c.name.trim().is_empty() || c.name.len() > 100 {
+        return Err("Component name must be 1-100 characters".into());
+    }
+    if c.description.len() > 1000 {
+        return Err("Component description must be under 1,000 characters".into());
+    }
+    if c.category.len() > 50 {
+        return Err("Component category must be under 50 characters".into());
+    }
+    if c.pin_count < 1 || c.pin_count > 100 {
+        return Err("Pin count must be between 1 and 100".into());
+    }
+    if c.icon_svg.len() > 50 * 1024 {
+        return Err("Component icon SVG too large (max 50KB)".into());
+    }
+    Ok(())
 }
 
-// Database Migrations
-fn run_migrations(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            rpi_model TEXT,
-            status TEXT NOT NULL DEFAULT 'planning',
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            color TEXT DEFAULT '#cc785c'
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tasks (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            description TEXT,
-            status TEXT NOT NULL DEFAULT 'backlog',
-            priority TEXT NOT NULL DEFAULT 'p2',
-            labels TEXT, -- JSON array
-            due_date INTEGER,
-            time_estimate INTEGER,
-            milestone_id TEXT,
-            canvas_node_id TEXT,
-            graph_node_id TEXT,
-            column_id TEXT NOT NULL,
-            position REAL NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS columns (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            color TEXT,
-            position REAL NOT NULL DEFAULT 0,
-            is_done INTEGER NOT NULL DEFAULT 0
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS canvas_states (
-            project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-            state_json TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS notes (
-            project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-            content TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS custom_components (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            category TEXT NOT NULL,
-            pin_count INTEGER NOT NULL,
-            icon_svg TEXT NOT NULL,
-            is_builtin INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        )",
-        [],
-    )?;
-
+fn validate_checklist_item(item: &models::ChecklistItem) -> std::result::Result<(), String> {
+    if item.id.is_empty() || item.id.len() > 100 {
+        return Err("Invalid checklist item ID".into());
+    }
+    if item.task_id.is_empty() || item.task_id.len() > 100 {
+        return Err("Invalid task ID in checklist item".into());
+    }
+    if item.text.trim().is_empty() || item.text.len() > 500 {
+        return Err("Checklist item text must be 1-500 characters".into());
+    }
     Ok(())
 }
 
@@ -209,8 +157,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 // Projects CRUD
 #[tauri::command]
-async fn create_project(app: AppHandle, project: Project) -> std::result::Result<Project, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn create_project(
+    state: tauri::State<'_, DbState>,
+    project: models::Project,
+) -> std::result::Result<models::Project, String> {
+    validate_project(&project)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -229,13 +181,15 @@ async fn create_project(app: AppHandle, project: Project) -> std::result::Result
 }
 
 #[tauri::command]
-async fn list_projects(app: AppHandle) -> std::result::Result<Vec<Project>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn list_projects(
+    state: tauri::State<'_, DbState>,
+) -> std::result::Result<Vec<models::Project>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("SELECT id, name, description, rpi_model, status, created_at, updated_at, color FROM projects ORDER BY updated_at DESC")
         .map_err(|e| e.to_string())?;
     
     let proj_iter = stmt.query_map([], |row| {
-        Ok(Project {
+        Ok(models::Project {
             id: row.get(0)?,
             name: row.get(1)?,
             description: row.get(2)?,
@@ -255,13 +209,16 @@ async fn list_projects(app: AppHandle) -> std::result::Result<Vec<Project>, Stri
 }
 
 #[tauri::command]
-async fn get_project(app: AppHandle, id: String) -> std::result::Result<Option<Project>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn get_project(
+    state: tauri::State<'_, DbState>,
+    id: String,
+) -> std::result::Result<Option<models::Project>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let res = conn.query_row(
         "SELECT id, name, description, rpi_model, status, created_at, updated_at, color FROM projects WHERE id = ?",
         [id],
         |row| {
-            Ok(Project {
+            Ok(models::Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 description: row.get(2)?,
@@ -278,50 +235,61 @@ async fn get_project(app: AppHandle, id: String) -> std::result::Result<Option<P
 
 #[tauri::command]
 async fn update_project(
-    app: AppHandle,
+    state: tauri::State<'_, DbState>,
     id: String,
     name: String,
     description: String,
     status: String,
     color: String,
-) -> std::result::Result<Project, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+) -> std::result::Result<models::Project, String> {
     let now = chrono::Utc::now().timestamp_millis();
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    
+    // Fetch current project to retain rpi_model for validation
+    let current_project = conn.query_row(
+        "SELECT rpi_model, created_at FROM projects WHERE id = ?",
+        [&id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    ).map_err(|e| e.to_string())?;
+
+    let updated = models::Project {
+        id: id.clone(),
+        name: name.clone(),
+        description: description.clone(),
+        rpi_model: current_project.0,
+        status: status.clone(),
+        created_at: current_project.1,
+        updated_at: now,
+        color: color.clone(),
+    };
+    validate_project(&updated)?;
+
     conn.execute(
         "UPDATE projects SET name = ?1, description = ?2, status = ?3, color = ?4, updated_at = ?5 WHERE id = ?6",
         params![name, description, status, color, now, id],
     ).map_err(|e| e.to_string())?;
 
-    let p = conn.query_row(
-        "SELECT id, name, description, rpi_model, status, created_at, updated_at, color FROM projects WHERE id = ?",
-        [id],
-        |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                rpi_model: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                color: row.get(7)?,
-            })
-        },
-    ).map_err(|e| e.to_string())?;
-    Ok(p)
+    Ok(updated)
 }
 
 #[tauri::command]
-async fn delete_project(app: AppHandle, id: String) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn delete_project(
+    state: tauri::State<'_, DbState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM projects WHERE id = ?", [id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 // Tasks CRUD
 #[tauri::command]
-async fn list_tasks(app: AppHandle, projectId: String) -> std::result::Result<Vec<Task>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn list_tasks(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+) -> std::result::Result<Vec<models::Task>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare(
         "SELECT id, project_id, title, description, status, priority, labels, due_date, time_estimate,
                 milestone_id, canvas_node_id, graph_node_id, column_id, position, created_at, updated_at
@@ -332,7 +300,7 @@ async fn list_tasks(app: AppHandle, projectId: String) -> std::result::Result<Ve
         let labels_str: String = row.get(6)?;
         let labels: Vec<String> = serde_json::from_str(&labels_str).unwrap_or_default();
         
-        Ok(Task {
+        Ok(models::Task {
             id: row.get(0)?,
             project_id: row.get(1)?,
             title: row.get(2)?,
@@ -360,8 +328,12 @@ async fn list_tasks(app: AppHandle, projectId: String) -> std::result::Result<Ve
 }
 
 #[tauri::command]
-async fn create_task(app: AppHandle, task: Task) -> std::result::Result<Task, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn create_task(
+    state: tauri::State<'_, DbState>,
+    task: models::Task,
+) -> std::result::Result<models::Task, String> {
+    validate_task(&task)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let labels_str = serde_json::to_string(&task.labels).unwrap_or_else(|_| "[]".to_string());
     
     conn.execute(
@@ -391,8 +363,12 @@ async fn create_task(app: AppHandle, task: Task) -> std::result::Result<Task, St
 }
 
 #[tauri::command]
-async fn update_task(app: AppHandle, task: Task) -> std::result::Result<Task, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn update_task(
+    state: tauri::State<'_, DbState>,
+    task: models::Task,
+) -> std::result::Result<models::Task, String> {
+    validate_task(&task)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let labels_str = serde_json::to_string(&task.labels).unwrap_or_else(|_| "[]".to_string());
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -426,22 +402,29 @@ async fn update_task(app: AppHandle, task: Task) -> std::result::Result<Task, St
 }
 
 #[tauri::command]
-async fn delete_task(app: AppHandle, id: String) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn delete_task(
+    state: tauri::State<'_, DbState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM tasks WHERE id = ?", [id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 // Columns
 #[tauri::command]
-async fn list_columns(app: AppHandle, projectId: String) -> std::result::Result<Vec<Column>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn list_columns(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+) -> std::result::Result<Vec<models::Column>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare("SELECT id, project_id, name, color, position, is_done FROM columns WHERE project_id = ? ORDER BY position ASC")
         .map_err(|e| e.to_string())?;
     
     let col_iter = stmt.query_map([projectId], |row| {
         let is_done_val: i32 = row.get(5)?;
-        Ok(Column {
+        Ok(models::Column {
             id: row.get(0)?,
             project_id: row.get(1)?,
             name: row.get(2)?,
@@ -459,8 +442,12 @@ async fn list_columns(app: AppHandle, projectId: String) -> std::result::Result<
 }
 
 #[tauri::command]
-async fn save_column(app: AppHandle, column: Column) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn save_column(
+    state: tauri::State<'_, DbState>,
+    column: models::Column,
+) -> std::result::Result<(), String> {
+    validate_column(&column)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let is_done_val = if column.is_done { 1 } else { 0 };
     
     conn.execute(
@@ -485,8 +472,14 @@ async fn save_column(app: AppHandle, column: Column) -> std::result::Result<(), 
 
 // Canvas States
 #[tauri::command]
-async fn save_canvas_state(app: AppHandle, projectId: String, state: String) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn save_canvas_state(
+    db_state: tauri::State<'_, DbState>,
+    projectId: String,
+    state: String,
+) -> std::result::Result<(), String> {
+    validate_canvas_state(&state)?;
+    let conn = db_state.conn.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
     
     conn.execute(
@@ -501,8 +494,12 @@ async fn save_canvas_state(app: AppHandle, projectId: String, state: String) -> 
 }
 
 #[tauri::command]
-async fn load_canvas_state(app: AppHandle, projectId: String) -> std::result::Result<Option<String>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn load_canvas_state(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+) -> std::result::Result<Option<String>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let res = conn.query_row(
         "SELECT state_json FROM canvas_states WHERE project_id = ?",
         [projectId],
@@ -513,8 +510,14 @@ async fn load_canvas_state(app: AppHandle, projectId: String) -> std::result::Re
 
 // Notes
 #[tauri::command]
-async fn save_notes(app: AppHandle, projectId: String, content: String) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn save_notes(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+    content: String,
+) -> std::result::Result<(), String> {
+    validate_notes(&content)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp_millis();
     
     conn.execute(
@@ -529,8 +532,12 @@ async fn save_notes(app: AppHandle, projectId: String, content: String) -> std::
 }
 
 #[tauri::command]
-async fn load_notes(app: AppHandle, projectId: String) -> std::result::Result<String, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+#[allow(non_snake_case)]
+async fn load_notes(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+) -> std::result::Result<String, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let res = conn.query_row(
         "SELECT content FROM notes WHERE project_id = ?",
         [projectId],
@@ -541,8 +548,10 @@ async fn load_notes(app: AppHandle, projectId: String) -> std::result::Result<St
 
 // Settings
 #[tauri::command]
-async fn get_settings(app: AppHandle) -> std::result::Result<UserSettings, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn get_settings(
+    state: tauri::State<'_, DbState>,
+) -> std::result::Result<models::UserSettings, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     
     let theme: String = conn.query_row("SELECT value FROM settings WHERE key = 'theme'", [], |row| row.get(0))
         .unwrap_or_else(|_| "dark".to_string());
@@ -555,7 +564,7 @@ async fn get_settings(app: AppHandle) -> std::result::Result<UserSettings, Strin
     let snap_to_grid_str: String = conn.query_row("SELECT value FROM settings WHERE key = 'snap_to_grid'", [], |row| row.get(0))
         .unwrap_or_else(|_| "true".to_string());
     
-    Ok(UserSettings {
+    Ok(models::UserSettings {
         theme,
         accent_color,
         font_size,
@@ -565,8 +574,12 @@ async fn get_settings(app: AppHandle) -> std::result::Result<UserSettings, Strin
 }
 
 #[tauri::command]
-async fn save_settings(app: AppHandle, settings: UserSettings) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn save_settings(
+    state: tauri::State<'_, DbState>,
+    settings: models::UserSettings,
+) -> std::result::Result<(), String> {
+    validate_settings(&settings)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     
     let kv = vec![
         ("theme", settings.theme),
@@ -586,9 +599,12 @@ async fn save_settings(app: AppHandle, settings: UserSettings) -> std::result::R
     Ok(())
 }
 
+// Custom Components
 #[tauri::command]
-async fn list_custom_components(app: AppHandle) -> std::result::Result<Vec<LibraryComponent>, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn list_custom_components(
+    state: tauri::State<'_, DbState>,
+) -> std::result::Result<Vec<models::LibraryComponent>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare("SELECT id, name, description, category, pin_count, icon_svg, is_builtin, created_at FROM custom_components ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
@@ -596,7 +612,7 @@ async fn list_custom_components(app: AppHandle) -> std::result::Result<Vec<Libra
     let list = stmt
         .query_map([], |row| {
             let is_builtin_int: i32 = row.get(6)?;
-            Ok(LibraryComponent {
+            Ok(models::LibraryComponent {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 description: row.get(2)?,
@@ -615,8 +631,12 @@ async fn list_custom_components(app: AppHandle) -> std::result::Result<Vec<Libra
 }
 
 #[tauri::command]
-async fn save_custom_component(app: AppHandle, component: LibraryComponent) -> std::result::Result<LibraryComponent, String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn save_custom_component(
+    state: tauri::State<'_, DbState>,
+    component: models::LibraryComponent,
+) -> std::result::Result<models::LibraryComponent, String> {
+    validate_custom_component(&component)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     let is_builtin_int = if component.is_builtin { 1 } else { 0 };
     
     conn.execute(
@@ -645,132 +665,121 @@ async fn save_custom_component(app: AppHandle, component: LibraryComponent) -> s
 }
 
 #[tauri::command]
-async fn delete_custom_component(app: AppHandle, id: String) -> std::result::Result<(), String> {
-    let conn = get_connection(&app).map_err(|e| e.to_string())?;
+async fn delete_custom_component(
+    state: tauri::State<'_, DbState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM custom_components WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
+// Checklist Items (ROB-04)
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-async fn deploy_and_run_pi(
-    app: AppHandle,
-    state: tauri::State<'_, PiConnectionState>,
-    ip: String,
-    username: String,
-    password_or_key: String,
-    auth_method: String, // "password" | "key"
-    code: String,
-    filename: String,
-) -> std::result::Result<String, String> {
-    // 1. Kill any existing active process
-    {
-        let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
-        if let Some(mut child) = child_lock.take() {
-            let _ = child.kill();
-        }
+#[allow(non_snake_case)]
+async fn list_checklist_items(
+    state: tauri::State<'_, DbState>,
+    taskId: String,
+) -> std::result::Result<Vec<models::ChecklistItem>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, task_id, text, done, position FROM checklist_items WHERE task_id = ? ORDER BY position ASC")
+        .map_err(|e| e.to_string())?;
+
+    let items_iter = stmt
+        .query_map([taskId], |row| {
+            let done_val: i32 = row.get(3)?;
+            Ok(models::ChecklistItem {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                text: row.get(2)?,
+                done: done_val != 0,
+                position: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut items = Vec::new();
+    for item in items_iter {
+        items.push(item.map_err(|e| e.to_string())?);
     }
-
-    // 2. Write code to a local temp file on host
-    let app_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| Error::Tauri(e.to_string()).to_string())?;
-    
-    let temp_filepath = app_dir.join(&filename);
-    std::fs::write(&temp_filepath, code).map_err(|e| e.to_string())?;
-
-    // 3. Construct SCP command to copy file to Pi
-    let destination = format!("{}@{}:/home/{}/{}", username, ip, username, filename);
-    
-    let mut scp_args = vec![
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-    ];
-    
-    let key_path_str;
-    if auth_method == "key" && !password_or_key.is_empty() {
-        key_path_str = password_or_key.clone();
-        scp_args.push("-i");
-        scp_args.push(&key_path_str);
-    }
-    
-    let temp_path_str = temp_filepath.to_string_lossy().to_string();
-    scp_args.push(&temp_path_str);
-    scp_args.push(&destination);
-
-    let scp_status = Command::new("scp")
-        .args(&scp_args)
-        .status()
-        .map_err(|e| format!("Failed to copy file via SCP: {}", e))?;
-
-    if !scp_status.success() {
-        return Err("SCP file copy failed. Verify host IP, SSH service status, and credentials.".into());
-    }
-
-    // 4. Spawn SSH command to run file on Pi:
-    let mut ssh_args = vec![
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-    ];
-
-    if auth_method == "key" && !password_or_key.is_empty() {
-        ssh_args.push("-i");
-        ssh_args.push(&password_or_key);
-    }
-
-    let host = format!("{}@{}", username, ip);
-    ssh_args.push(&host);
-    
-    let run_cmd = format!("python3 -u /home/{}/{}", username, filename);
-    ssh_args.push(&run_cmd);
-
-    let mut child = Command::new("ssh")
-        .args(&ssh_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run SSH command: {}", e))?;
-
-    let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
-
-    // 5. Store child process handle
-    {
-        let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
-        *child_lock = Some(child);
-    }
-
-    // 6. Spawn background threads to read stdout/stderr and emit Tauri events in real-time
-    let app_handle_stdout = app.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for l in reader.lines().map_while(|line| line.ok()) {
-            let _ = app_handle_stdout.emit("pi-console-log", l);
-        }
-    });
-
-    let app_handle_stderr = app.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for l in reader.lines().map_while(|line| line.ok()) {
-            let _ = app_handle_stderr.emit("pi-console-log", format!("[ERROR] {}", l));
-        }
-    });
-
-    Ok("Scaffold script deployed and executing on remote board!".into())
+    Ok(items)
 }
 
 #[tauri::command]
-async fn stop_pi_execution(state: tauri::State<'_, PiConnectionState>) -> std::result::Result<String, String> {
-    let mut child_lock = state.child_process.lock().map_err(|e| e.to_string())?;
-    if let Some(mut child) = child_lock.take() {
-        let _ = child.kill();
-        Ok("Remote process execution halted.".into())
-    } else {
-        Ok("No remote process currently executing.".into())
-    }
+async fn save_checklist_item(
+    state: tauri::State<'_, DbState>,
+    item: models::ChecklistItem,
+) -> std::result::Result<(), String> {
+    validate_checklist_item(&item)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let done_val = if item.done { 1 } else { 0 };
+
+    conn.execute(
+        "INSERT INTO checklist_items (id, task_id, text, done, position)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+            text = EXCLUDED.text,
+            done = EXCLUDED.done,
+            position = EXCLUDED.position",
+        params![item.id, item.task_id, item.text, done_val, item.position],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_checklist_item(
+    state: tauri::State<'_, DbState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM checklist_items WHERE id = ?", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Graph States (ROB-05)
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn save_graph_state(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+    stateJson: String,
+) -> std::result::Result<(), String> {
+    validate_canvas_state(&stateJson)?;
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+
+    conn.execute(
+        "INSERT INTO graph_states (project_id, state_json, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(project_id) DO UPDATE SET
+            state_json = EXCLUDED.state_json,
+            updated_at = EXCLUDED.updated_at",
+        params![projectId, stateJson, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn load_graph_state(
+    state: tauri::State<'_, DbState>,
+    projectId: String,
+) -> std::result::Result<Option<String>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let res = conn
+        .query_row(
+            "SELECT state_json FROM graph_states WHERE project_id = ?",
+            [projectId],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(res)
 }
 
 // Build runner setup
@@ -780,9 +789,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let conn = get_connection(app.handle())?;
+            
+            // PERF-02: Enable WAL mode, busy timeout, and synchronous NORMAL using pragma_update
+            conn.pragma_update(None, "journal_mode", &"WAL")?;
+            conn.pragma_update(None, "busy_timeout", &5000)?;
+            conn.pragma_update(None, "synchronous", &"NORMAL")?;
+
             run_migrations(&conn)?;
+            
+            app.manage(DbState {
+                conn: std::sync::Mutex::new(conn),
+            });
             app.manage(PiConnectionState {
-                child_process: Mutex::new(None),
+                child_process: std::sync::Mutex::new(None),
             });
             Ok(())
         })
@@ -807,8 +826,13 @@ pub fn run() {
             list_custom_components,
             save_custom_component,
             delete_custom_component,
-            deploy_and_run_pi,
-            stop_pi_execution
+            list_checklist_items,
+            save_checklist_item,
+            delete_checklist_item,
+            save_graph_state,
+            load_graph_state,
+            deploy::deploy_and_run_pi,
+            deploy::stop_pi_execution
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -818,9 +842,8 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    // Helper to spin up an in-memory SQLite database and run migrations
-    fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("Failed to open test database");
+    fn setup_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("Failed to open test database");
         run_migrations(&conn).expect("Failed to run database migrations");
         conn
     }
@@ -845,12 +868,13 @@ mod tests {
         assert!(tables.contains(&"canvas_states".to_string()));
         assert!(tables.contains(&"notes".to_string()));
         assert!(tables.contains(&"settings".to_string()));
+        assert!(tables.contains(&"checklist_items".to_string()));
+        assert!(tables.contains(&"graph_states".to_string()));
     }
 
     #[test]
     fn test_project_crud_lifecycle() {
         let conn = setup_test_db();
-        
         let project_id = "test-project-uuid-1".to_string();
         
         // 1. Create Project
@@ -1013,97 +1037,4 @@ mod tests {
             .unwrap();
         assert_eq!(loaded_notes, markdown_notes);
     }
-
-    #[test]
-    fn test_user_settings_configuration() {
-        let conn = setup_test_db();
-
-        // Save settings key-values
-        let settings = vec![
-            ("theme", "warm"),
-            ("accent_color", "teal"),
-            ("grid_type", "lines"),
-            ("snap_to_grid", "true"),
-        ];
-
-        for (k, v) in settings {
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
-                [k, v],
-            ).unwrap();
-        }
-
-        // Verify loaded settings match
-        let theme: String = conn
-            .query_row("SELECT value FROM settings WHERE key = 'theme'", [], |row| row.get(0))
-            .unwrap();
-        let snap: String = conn
-            .query_row("SELECT value FROM settings WHERE key = 'snap_to_grid'", [], |row| row.get(0))
-            .unwrap();
-            
-        assert_eq!(theme, "warm");
-        assert_eq!(snap, "true");
-    }
-
-    #[test]
-    fn test_columns_crud_and_project_cascade_deletion() {
-        let conn = setup_test_db();
-        let proj_id = "proj-column-test".to_string();
-        let col_id = "col-backlog".to_string();
-
-        // 1. Seed project
-        conn.execute(
-            "INSERT INTO projects (id, name, description, rpi_model, status, created_at, updated_at, color)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![proj_id, "Column Test Project", "Desc", "rpi5", "planning", 100, 100, "teal"],
-        ).unwrap();
-
-        // 2. Insert Column
-        conn.execute(
-            "INSERT INTO columns (id, project_id, name, color, position, is_done)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![col_id, proj_id, "Sprint Backlog", "#5db8a6", 1.0, 0],
-        ).unwrap();
-
-        // Verify column exists
-        let name: String = conn
-            .query_row(
-                "SELECT name FROM columns WHERE id = ?",
-                [&col_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(name, "Sprint Backlog");
-
-        // 3. Update Column
-        conn.execute(
-            "UPDATE columns SET name = ?, position = ? WHERE id = ?",
-            params!["Refined Backlog", 2.0, col_id],
-        ).unwrap();
-
-        let (updated_name, pos): (String, f64) = conn
-            .query_row(
-                "SELECT name, position FROM columns WHERE id = ?",
-                [&col_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(updated_name, "Refined Backlog");
-        assert_eq!(pos, 2.0);
-
-        // 4. Cascade Delete Project -> verifies columns are deleted automatically
-        conn.execute("DELETE FROM projects WHERE id = ?", [&proj_id]).unwrap();
-
-        let col_exists: Option<String> = conn
-            .query_row(
-                "SELECT name FROM columns WHERE id = ?",
-                [&col_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap();
-        assert!(col_exists.is_none()); // Deleted by cascade!
-    }
 }
-

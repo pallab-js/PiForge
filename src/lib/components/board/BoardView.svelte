@@ -4,9 +4,11 @@
   import { addToast } from '../../stores/ui.store';
   import type { Task, Column, ChecklistItem } from '../../types';
   import * as ipc from '../../ipc';
+  import ConfirmModal from '../shared/ConfirmModal.svelte';
 
   let activeTaskId = $state<string | null>(null);
   let activeTask = $derived($tasksList.find(t => t.id === activeTaskId) || null);
+  let isDeleteModalOpen = $state(false);
 
   // Timeline view state
   let isGanttView = $state(false);
@@ -844,12 +846,7 @@
 
       <div class="border-t border-[var(--border-subtle)] pt-3 mt-4 flex select-none">
         <button 
-          onclick={async () => {
-            if (confirm('Delete this task permanently?')) {
-              await deleteTaskItem(activeTaskId!);
-              activeTaskId = null;
-            }
-          }}
+          onclick={() => isDeleteModalOpen = true}
           class="w-full py-2 bg-[var(--color-error)]/10 hover:bg-[var(--color-error)]/25 text-[var(--color-error)] border border-[var(--color-error)]/30 rounded text-xs font-semibold cursor-pointer"
         >
           🗑️ Delete Sprint Task
@@ -857,6 +854,25 @@
       </div>
     </div>
   {/if}
+
+  <ConfirmModal
+    isOpen={isDeleteModalOpen}
+    title="Delete Task"
+    message="Are you sure you want to delete this sprint task permanently? This action cannot be undone."
+    confirmText="Delete"
+    cancelText="Cancel"
+    type="danger"
+    onConfirm={async () => {
+      isDeleteModalOpen = false;
+      if (activeTaskId) {
+        await deleteTaskItem(activeTaskId);
+        activeTaskId = null;
+      }
+    }}
+    onCancel={() => {
+      isDeleteModalOpen = false;
+    }}
+  />
 </div>
 
 <style>

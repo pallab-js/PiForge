@@ -14,6 +14,9 @@ export const nodeSimStates = writable<Record<string, any>>({});
 // E.g. boardPinStates[pinPhysicalNumber] = 0 | 1 (Low / High)
 export const boardPinStates = writable<Record<string, 0 | 1>>({});
 
+// Precomputed set of powered canvas edges (PERF-06)
+export const poweredEdges = writable<Set<string>>(new Set());
+
 // Track current macro loop interval for automated runs (e.g. blinking)
 let macroInterval: any = null;
 export const activeMacroName = writable<string | null>(null);
@@ -23,6 +26,7 @@ export function resetSimulation() {
   stopMacro();
   nodeSimStates.set({});
   boardPinStates.set({});
+  poweredEdges.set(new Set());
 }
 
 // Toggle simulation mode
@@ -221,52 +225,23 @@ export function propagateSignals() {
 
     return next;
   });
+
+  // 4. Update powered edges set (PERF-06)
+  const poweredSet = new Set<string>();
+  canvas.edges.forEach(edge => {
+    const srcPin = `${edge.sourceId}:${edge.sourcePinId || '1'}`;
+    const dstPin = `${edge.targetId}:${edge.targetPinId || '1'}`;
+    if (poweredPins.has(srcPin) || poweredPins.has(dstPin)) {
+      poweredSet.add(edge.id);
+    }
+  });
+  poweredEdges.set(poweredSet);
 }
 
 // Helper to check if a specific canvas edge/wire is currently carrying voltage
-export function isEdgePowered(edgeId: string, canvas: CanvasState): boolean {
+export function isEdgePowered(edgeId: string, _canvas?: CanvasState): boolean {
   if (!get(isSimulating)) return false;
-
-  const edge = canvas.edges.find(e => e.id === edgeId);
-  if (!edge) return false;
-
-  const currentStates = get(nodeSimStates);
-  const currentPinStates = get(boardPinStates);
-
-  // Recompute simple power check for this single edge path
-  const boardNode = canvas.nodes.find(n => n.type === 'rpi_board');
-  
-  // Is either endpoint of this edge connected to an active power pin or active component?
-  const isSourceActive = isNodePinActive(edge.sourceId, edge.sourcePinId, boardNode, currentPinStates, currentStates);
-  const isTargetActive = isNodePinActive(edge.targetId, edge.targetPinId, boardNode, currentPinStates, currentStates);
-
-  return isSourceActive || isTargetActive;
-}
-
-function isNodePinActive(nodeId: string, pinId: string | undefined, boardNode: CanvasNode | undefined, pinStates: Record<string, number>, compStates: Record<string, any>): boolean {
-  if (!pinId) return false;
-
-  // Board pin check
-  if (boardNode && nodeId === boardNode.id) {
-    const header = boardNode.boardModel?.includes('pico') ? RPI_PICO_HEADER : RPI_40PIN_HEADER;
-    const pin = header.find(p => p.physical.toString() === pinId);
-    if (!pin) return false;
-    if (pin.type === 'power5v' || pin.type === 'power3v3') return true;
-    return pinStates[pinId] === 1;
-  }
-
-  // Component check
-  const state = compStates[nodeId];
-  if (!state) return false;
-  
-  const node = get(activeCanvasState)?.nodes.find(n => n.id === nodeId);
-  if (node && node.type === 'component') {
-    if (node.componentId === 'button' && pinId === '1') {
-      return state.pressed;
-    }
-  }
-
-  return false;
+  return get(poweredEdges).has(edgeId);
 }
 
 // MACRO SCHEDULERS (Auto firmware loops simulation)

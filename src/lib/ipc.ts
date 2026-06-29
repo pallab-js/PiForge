@@ -16,7 +16,14 @@ class MockDb {
   private getStorage<T>(key: string, defaultValue: T): T {
     if (typeof localStorage === 'undefined') return defaultValue;
     const data = localStorage.getItem(`piforge_${key}`);
-    return data ? JSON.parse(data) : defaultValue;
+    if (!data) return defaultValue;
+    try {
+      return JSON.parse(data);
+    } catch {
+      console.warn(`Corrupted localStorage for ${key}, resetting to default`);
+      localStorage.removeItem(`piforge_${key}`);
+      return defaultValue;
+    }
   }
 
   private setStorage<T>(key: string, value: T): void {
@@ -519,10 +526,24 @@ export async function deleteTask(id: string): Promise<void> {
 
 // CHECKLIST OPERATIONS
 export async function getChecklistItems(taskId: string): Promise<ChecklistItem[]> {
+  if (isTauri()) {
+    try {
+      return await invoke<ChecklistItem[]>('list_checklist_items', { taskId });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
   return mockDb.checklistItems.filter(item => item.task_id === taskId);
 }
 
 export async function saveChecklistItem(item: ChecklistItem): Promise<void> {
+  if (isTauri()) {
+    try {
+      return await invoke<void>('save_checklist_item', { item });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
   const items = mockDb.checklistItems;
   const index = items.findIndex(i => i.id === item.id);
   if (index === -1) {
@@ -534,6 +555,13 @@ export async function saveChecklistItem(item: ChecklistItem): Promise<void> {
 }
 
 export async function deleteChecklistItem(id: string): Promise<void> {
+  if (isTauri()) {
+    try {
+      return await invoke<void>('delete_checklist_item', { id });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
   mockDb.checklistItems = mockDb.checklistItems.filter(i => i.id !== id);
 }
 
@@ -605,12 +633,27 @@ export async function loadCanvasState(projectId: string): Promise<CanvasState | 
 
 // GRAPH STATE
 export async function saveGraphState(projectId: string, state: GraphState): Promise<void> {
+  if (isTauri()) {
+    try {
+      return await invoke<void>('save_graph_state', { projectId, state: JSON.stringify(state) });
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
   const graph = mockDb.graphStates;
   graph[projectId] = state;
   mockDb.graphStates = graph;
 }
 
 export async function loadGraphState(projectId: string): Promise<GraphState | null> {
+  if (isTauri()) {
+    try {
+      const stateStr = await invoke<string | null>('load_graph_state', { projectId });
+      return stateStr ? JSON.parse(stateStr) : null;
+    } catch (e) {
+      console.warn('Tauri invoke failed, using mock:', e);
+    }
+  }
   return mockDb.graphStates[projectId] || null;
 }
 

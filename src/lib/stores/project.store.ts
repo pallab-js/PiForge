@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store';
-import type { Project, Task, Column, CanvasState, GraphState } from '../types';
+import type { Project, Task, Column, CanvasState } from '../types';
 import * as ipc from '../ipc';
 import { addToast } from './ui.store';
 
@@ -21,8 +21,9 @@ let canvasUndoStack: CanvasState[] = [];
 let canvasRedoStack: CanvasState[] = [];
 const MAX_HISTORY = 100;
 
-// Debouncing auto-save
-let saveTimeout: any = null;
+// Debouncing auto-save (ROB-01: Split save timeouts)
+let canvasSaveTimeout: any = null;
+let notesSaveTimeout: any = null;
 export const isSaving = writable(false);
 
 export async function initProjects() {
@@ -49,12 +50,37 @@ export async function selectProject(projectId: string) {
     const tasks = await ipc.listTasks(projectId);
     tasksList.set(tasks);
 
-    // Load Notes
-    const notesStr = await ipc.loadNotes(projectId);
+    // Load Notes (ROB-02: Fallback restore)
+    let notesStr = '';
+    if (typeof localStorage !== 'undefined') {
+      const fallbackNotes = localStorage.getItem(`piforge_fallback_notes_${projectId}`);
+      if (fallbackNotes !== null) {
+        notesStr = fallbackNotes;
+        addToast('Restored unsaved notes from browser cache', 'info');
+      }
+    }
+    if (!notesStr) {
+      notesStr = await ipc.loadNotes(projectId);
+    }
     projectNotes.set(notesStr);
 
-    // Load Canvas
-    const canvas = await ipc.loadCanvasState(projectId);
+    // Load Canvas (ROB-02: Fallback restore)
+    let canvas = null;
+    if (typeof localStorage !== 'undefined') {
+      const fallback = localStorage.getItem(`piforge_fallback_canvas_${projectId}`);
+      if (fallback) {
+        try {
+          canvas = JSON.parse(fallback);
+          addToast('Restored unsaved canvas changes from browser cache', 'info');
+        } catch (e) {
+          console.error('Failed to parse fallback canvas state:', e);
+        }
+      }
+    }
+    if (!canvas) {
+      canvas = await ipc.loadCanvasState(projectId);
+    }
+
     if (canvas) {
       activeCanvasState.set(canvas);
     } else {
@@ -138,6 +164,21 @@ export async function deleteActiveProject() {
   }
 }
 
+export async function deleteProjectById(id: string) {
+  try {
+    await ipc.deleteProject(id);
+    const current = get(activeProject);
+    if (current && current.id === id) {
+      activeProject.set(null);
+    }
+    await initProjects();
+    addToast('Project deleted successfully', 'success');
+  } catch (e) {
+    console.error(e);
+    addToast('Failed to delete project', 'error');
+  }
+}
+
 // TASK ACTIONS
 export async function addTask(title: string, columnId: string, priority: Task['priority'] = 'p2', labels: string[] = []) {
   const proj = get(activeProject);
@@ -168,21 +209,24 @@ export async function addTask(title: string, columnId: string, priority: Task['p
   }
 }
 
+// ROB-03: Clean task updating avoiding mutation and double-writes
 export async function updateTaskItem(task: Task) {
   try {
-    const updated = await ipc.updateTask(task);
-    tasksList.update(list => list.map(t => t.id === task.id ? updated : t));
-    
-    // Check if task status should be updated based on column
+    // Determine target status based on column first
+    let targetStatus = task.status;
     const cols = get(columnsList);
     const col = cols.find(c => c.id === task.column_id);
     if (col) {
-      const targetStatus = col.is_done ? 'done' : 'backlog';
-      if (task.status !== targetStatus) {
-        task.status = targetStatus;
-        await ipc.updateTask(task);
-      }
+      targetStatus = col.is_done ? 'done' : 'backlog';
     }
+
+    const taskToSave: Task = {
+      ...task,
+      status: targetStatus,
+    };
+
+    const updated = await ipc.updateTask(taskToSave);
+    tasksList.update(list => list.map(t => t.id === task.id ? updated : t));
   } catch (e) {
     console.error(e);
     addToast('Failed to update task', 'error');
@@ -200,10 +244,9 @@ export async function deleteTaskItem(id: string) {
   }
 }
 
-// CANVAS HISTORIES (UNDO / REDO)
+// CANVAS HISTORIES (UNDO / REDO) - PERF-05: High-perf structuredClone
 export function pushCanvasHistory(state: CanvasState) {
-  // Deep clone to prevent direct mutations
-  const clone = JSON.parse(JSON.stringify(state));
+  const clone = structuredClone(state);
   canvasUndoStack.push(clone);
   if (canvasUndoStack.length > MAX_HISTORY) {
     canvasUndoStack.shift();
@@ -213,7 +256,7 @@ export function pushCanvasHistory(state: CanvasState) {
 
 export function undoCanvas() {
   if (canvasUndoStack.length === 0) return;
-  const current = JSON.parse(JSON.stringify(get(activeCanvasState)));
+  const current = structuredClone(get(activeCanvasState));
   canvasRedoStack.push(current);
 
   const previous = canvasUndoStack.pop()!;
@@ -224,7 +267,7 @@ export function undoCanvas() {
 
 export function redoCanvas() {
   if (canvasRedoStack.length === 0) return;
-  const current = JSON.parse(JSON.stringify(get(activeCanvasState)));
+  const current = structuredClone(get(activeCanvasState));
   canvasUndoStack.push(current);
 
   const next = canvasRedoStack.pop()!;
@@ -239,22 +282,84 @@ export function updateCanvasStateDirectly(state: CanvasState) {
   saveCanvasDebounced(state);
 }
 
+// ROB-02: Retry mechanism and local storage fallback for canvas saving
+async function saveCanvasWithRetry(projectId: string, state: CanvasState) {
+  let attempts = 3;
+  let delay = 500;
+  while (attempts > 0) {
+    try {
+      await ipc.saveCanvasState(projectId, state);
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(`piforge_fallback_canvas_${projectId}`);
+      }
+      return;
+    } catch (e) {
+      attempts--;
+      if (attempts === 0) {
+        console.error('Persistent canvas save failure, saving to fallback local storage:', e);
+        if (typeof localStorage !== 'undefined') {
+          try {
+            localStorage.setItem(`piforge_fallback_canvas_${projectId}`, JSON.stringify(state));
+          } catch (storageError) {
+            console.error('Failed to write emergency fallback to localStorage:', storageError);
+          }
+        }
+        addToast('Failed to save canvas to database. Saved to browser fallback.', 'error');
+        throw e;
+      }
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay *= 2;
+    }
+  }
+}
+
 function saveCanvasDebounced(state: CanvasState) {
   const proj = get(activeProject);
   if (!proj) return;
 
   isSaving.set(true);
-  if (saveTimeout) clearTimeout(saveTimeout);
+  if (canvasSaveTimeout) clearTimeout(canvasSaveTimeout);
 
-  saveTimeout = setTimeout(async () => {
+  canvasSaveTimeout = setTimeout(async () => {
     try {
-      await ipc.saveCanvasState(proj.id, state);
+      await saveCanvasWithRetry(proj.id, state);
     } catch (e) {
       console.error('Auto-save canvas failed:', e);
     } finally {
       isSaving.set(false);
     }
   }, 1000); // 1-second debounce
+}
+
+// ROB-02: Retry mechanism and local storage fallback for notes saving
+async function saveNotesWithRetry(projectId: string, content: string) {
+  let attempts = 3;
+  let delay = 500;
+  while (attempts > 0) {
+    try {
+      await ipc.saveNotes(projectId, content);
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(`piforge_fallback_notes_${projectId}`);
+      }
+      return;
+    } catch (e) {
+      attempts--;
+      if (attempts === 0) {
+        console.error('Persistent notes save failure, saving to fallback local storage:', e);
+        if (typeof localStorage !== 'undefined') {
+          try {
+            localStorage.setItem(`piforge_fallback_notes_${projectId}`, content);
+          } catch (storageError) {
+            console.error('Failed to write emergency notes fallback:', storageError);
+          }
+        }
+        addToast('Failed to save notes to database. Saved to browser fallback.', 'error');
+        throw e;
+      }
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay *= 2;
+    }
+  }
 }
 
 // NOTES SAVE
@@ -264,11 +369,11 @@ export function updateNotes(content: string) {
   if (!proj) return;
 
   isSaving.set(true);
-  if (saveTimeout) clearTimeout(saveTimeout);
+  if (notesSaveTimeout) clearTimeout(notesSaveTimeout);
 
-  saveTimeout = setTimeout(async () => {
+  notesSaveTimeout = setTimeout(async () => {
     try {
-      await ipc.saveNotes(proj.id, content);
+      await saveNotesWithRetry(proj.id, content);
     } catch (e) {
       console.error('Auto-save notes failed:', e);
     } finally {

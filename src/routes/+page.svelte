@@ -1,16 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { settings } from '../lib/stores/settings.store';
-  import { initProjects, projectsList, activeProject, createNewProject, selectProject } from '../lib/stores/project.store';
+  import { initProjects, projectsList, activeProject, createNewProject, selectProject, deleteProjectById } from '../lib/stores/project.store';
   import { addToast, toasts, removeToast } from '../lib/stores/ui.store';
   import { BOARDS } from '../lib/rpi-boards';
   import AppShell from '../lib/components/layout/AppShell.svelte';
+  import ConfirmModal from '../lib/components/shared/ConfirmModal.svelte';
 
   import { initCustomComponents } from '../lib/stores/components.store';
 
   // Dashboard state
   let searchQuery = $state('');
   let isCreateOpen = $state(false);
+  let isDeleteOpen = $state(false);
+  let projectToDelete = $state<{ id: string, name: string } | null>(null);
 
   // New project form values
   let newName = $state('');
@@ -141,10 +144,25 @@
                       {proj.name}
                     </span>
                   </div>
-                  <!-- Status badge -->
-                  <span class="px-2 py-0.5 bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[9px] font-bold font-mono rounded-full uppercase tracking-wider text-[var(--text-secondary)]">
-                    {proj.status}
-                  </span>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <!-- Status badge -->
+                    <span class="px-2 py-0.5 bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[9px] font-bold font-mono rounded-full uppercase tracking-wider text-[var(--text-secondary)]">
+                      {proj.status}
+                    </span>
+                    <!-- Delete project button -->
+                    <button 
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        projectToDelete = { id: proj.id, name: proj.name };
+                        isDeleteOpen = true;
+                      }}
+                      onkeydown={(e) => e.stopPropagation()}
+                      class="p-1 rounded text-neutral-500 hover:text-red-500 hover:bg-[var(--bg-card)] transition-colors cursor-pointer text-xs"
+                      title="Delete project"
+                    >
+                      🗑️
+                    </button>
+                  </div>
                 </div>
 
                 <!-- Description -->
@@ -275,6 +293,26 @@
         </button>
       </div>
     </form>
+
+    <ConfirmModal
+      isOpen={isDeleteOpen}
+      title="Delete Project"
+      message={`Are you sure you want to delete project "${projectToDelete?.name || ''}" permanently? All schematics, tasks, columns, notes, and remote configurations will be permanently erased.`}
+      confirmText="Delete"
+      cancelText="Cancel"
+      type="danger"
+      onConfirm={async () => {
+        isDeleteOpen = false;
+        if (projectToDelete) {
+          await deleteProjectById(projectToDelete.id);
+          projectToDelete = null;
+        }
+      }}
+      onCancel={() => {
+        isDeleteOpen = false;
+        projectToDelete = null;
+      }}
+    />
   </div>
 {/if}
 

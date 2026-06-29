@@ -367,7 +367,7 @@ ${loopLines.length > 0 ? loopLines.join('\n') : '    delay(1000);'}
   let piIp = $state('raspberrypi.local');
   let piUser = $state('pi');
   let piAuthMethod = $state<'password' | 'key'>('key');
-  let piPasswordOrKey = $state('/Users/pallabpc/.ssh/id_rsa');
+  let piPasswordOrKey = $state('~/.ssh/id_rsa');
   let isDeploying = $state(false);
   let isExecuting = $state(false);
   let piConsoleLogs = $state<string[]>(['PiForge Remote Console initialized.', 'Status: Ready to deploy.']);

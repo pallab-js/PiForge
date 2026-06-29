@@ -1,7 +1,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions a11y-no-static-element-interactions a11y_click_events_have_key_events a11y-click-events-have-key-events -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { activeCanvasState, updateCanvasStateDirectly, tasksList, pushCanvasHistory, undoCanvas, redoCanvas } from '../../stores/project.store';
+  import { activeCanvasState, updateCanvasStateDirectly, tasksList, pushCanvasHistory, undoCanvas, redoCanvas, activeProject } from '../../stores/project.store';
   import { selectedNodeId, selectedEdgeId, selectedPinId, addToast } from '../../stores/ui.store';
   import { settings } from '../../stores/settings.store';
   import { BOARDS, RPI_40PIN_HEADER, RPI_PICO_HEADER } from '../../rpi-boards';
@@ -16,7 +16,7 @@
     toggleSimulation, 
     toggleBoardPin, 
     updateNodeSimState, 
-    isEdgePowered, 
+    poweredEdges, 
     activeMacroName, 
     startMacro, 
     stopMacro 
@@ -87,6 +87,8 @@
     type: 'error' | 'warning';
     message: string;
   }
+
+  const nodeMap = $derived(new Map($activeCanvasState.nodes.map(n => [n.id, n])));
 
   let diagnostics = $derived.by<DiagnosticIssue[]>(() => {
     const canvas = $activeCanvasState;
@@ -540,12 +542,36 @@
     editingNodeId = null;
   }
 
-  // KEYBOARD DELETES
+  // KEYBOARD SHORTCUTS
   function handleKeyDown(e: KeyboardEvent) {
-    if (e.key === 'Backspace' || e.key === 'Delete') {
-      // Don't delete if user is currently typing in an input or textarea
-      const target = e.target as HTMLElement;
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || isEditingText) return;
+    // Don't trigger if user is currently typing in an input or textarea
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || isEditingText) return;
+
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+    const modifierKey = isMac ? e.metaKey : e.ctrlKey;
+
+    if (modifierKey && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) {
+        redoCanvas();
+      } else {
+        undoCanvas();
+      }
+    } else if (modifierKey && e.key.toLowerCase() === 'y') {
+      e.preventDefault();
+      redoCanvas();
+    } else if (modifierKey && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      const proj = $activeProject;
+      const canvas = $activeCanvasState;
+      if (proj && canvas) {
+        ipc.saveCanvasState(proj.id, canvas)
+          .then(() => addToast('Project saved', 'success'))
+          .catch(() => addToast('Failed to save project', 'error'));
+      }
+    } else if (e.key === 'Backspace' || e.key === 'Delete') {
+      e.preventDefault();
       handleDeleteSelected();
     }
   }
@@ -591,8 +617,8 @@
     <!-- SVG Wires Connection Layer -->
     <svg class="absolute inset-0 w-[5000px] h-[5000px] pointer-events-auto" style="overflow: visible;">
       {#each $activeCanvasState.edges as edge}
-        {@const src = $activeCanvasState.nodes.find(n => n.id === edge.sourceId)}
-        {@const dst = $activeCanvasState.nodes.find(n => n.id === edge.targetId)}
+        {@const src = nodeMap.get(edge.sourceId)}
+        {@const dst = nodeMap.get(edge.targetId)}
         
         {#if src && dst}
           <!-- Calculate start/end line coordinates -->
@@ -602,7 +628,7 @@
           {@const y2 = dst.y + (edge.targetPinId ? 15 : dst.height/2)}
           
           {@const midX = x1 + (x2 - x1) / 2}
-          {@const isPowered = $isSimulating && isEdgePowered(edge.id, $activeCanvasState)}
+          {@const isPowered = $isSimulating && $poweredEdges.has(edge.id)}
           {@const pathD = isOrthogonal 
             ? computeOrthogonalPath(x1, y1, x2, y2) 
             : `M ${x1} ${y1} C ${x1 + (x2 - x1)/2} ${y1}, ${x1 + (x2 - x1)/2} ${y2}, ${x2} ${y2}`}
